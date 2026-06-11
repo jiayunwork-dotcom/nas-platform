@@ -190,8 +190,9 @@ def create_experiment_page():
         st.subheader("🔧 操作集配置")
 
         enabled_ops = []
-        for op_name in OP_NAMES[:-1]:
-            if st.checkbox(OP_DISPLAY_NAMES.get(op_name, op_name), value=True, key=f"op_{op_name}"):
+        for op_name in OP_NAMES:
+            default_val = True if op_name != 'zero' else False
+            if st.checkbox(OP_DISPLAY_NAMES.get(op_name, op_name), value=default_val, key=f"op_{op_name}"):
                 enabled_ops.append(op_name)
 
         if len(enabled_ops) == 0:

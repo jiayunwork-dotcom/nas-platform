@@ -34,18 +34,19 @@ class SurrogateMLP(nn.Module):
     3层MLP代理模型
     输入: 架构编码向量
     输出: 预测的 [精度, 参数量, 延迟]
+    使用LayerNorm替代BatchNorm以避免小batch问题
     """
     def __init__(self, input_dim: int, hidden_dim: int = 256, output_dim: int = 3):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim // 2, output_dim),
         )
