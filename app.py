@@ -343,14 +343,23 @@ def create_experiment_page():
         st.subheader("🧠 自适应调度")
 
         use_adaptive = st.checkbox("启用自适应调度", value=True,
-                                  help="根据搜索过程实时反馈自动切换评估策略和调整进化参数")
-        if use_adaptive:
-            st.caption("✅ 自适应调度将:")
-            st.caption("• 前5代使用SynFlow快速筛选，积累初始样本")
-            st.caption("• 第6代起代理就绪后切换为代理预筛+快速评估混合模式")
-            st.caption("• 连续3代HV增长率<5%时自动升级评估精度")
-            st.caption("• 帕累托解减少>20%时触发多样性警报并强制校准")
-            st.caption("• 根据种群多样性动态调整变异/交叉概率")
+                                  help="根据搜索过程实时反馈自动切换评估策略和调整进化参数",
+                                  key="cb_use_adaptive")
+
+        adaptive_placeholder = st.container()
+        with adaptive_placeholder:
+            if use_adaptive:
+                st.success("✅ 自适应调度已启用，将采用以下智能策略：")
+                st.markdown("""
+                - **阶段1（前5代）**: 使用SynFlow零代价代理快速筛选，积累初始样本
+                - **阶段2（第6代+）**: 代理模型就绪后，切换为「代理预筛 + 快速真实评估」的混合模式
+                - **HV低增长触发**: 连续3代超体积增长率<5%，自动升级为更精确的评估策略（fast→synflow→naswot→...）
+                - **多样性警报触发**: 帕累托前沿解减少>20%，强制对当前前沿解做完整评估校准
+                - **进化参数自适应**: 种群多样性<0.3时变异率↑50%，>0.7时变异率↓30%，交叉率反向调整
+                """)
+                st.caption("💡 每次策略切换都会记录详细日志，可在实验详情页的「策略日志」tab查看。")
+            else:
+                st.info("ℹ️ 自适应调度已关闭，将使用固定的评估策略和进化参数（勾选上方复选框可启用智能调度）。")
 
     st.markdown("---")
 
@@ -695,8 +704,24 @@ def view_experiment_page():
         with tab5:
             st.subheader("🧠 代理模型性能预测置信度分析")
 
-            if exp.surrogate is None or not exp.surrogate.trained:
-                st.info("🤖 代理模型尚未训练或未启用，暂无预测分析数据。")
+            if len(result.all_evaluated) == 0:
+                st.warning("⚠️ 实验尚未完成或还未评估任何架构，暂无预测分析数据。")
+                st.info("💡 提示：运行实验后，代理模型会根据评估的架构自动训练，训练完成后可在此查看预测分析。")
+            elif exp.surrogate is None:
+                st.warning("⚠️ 该实验未启用代理模型，无法进行预测分析。")
+                st.info("💡 提示：创建实验时请勾选「启用代理模型预筛」选项。")
+            elif not exp.surrogate.trained:
+                n_eval = len(result.all_evaluated)
+                min_samples = exp.config.surrogate_min_samples if hasattr(exp.config, 'surrogate_min_samples') else 50
+                st.info(f"🤖 代理模型尚未训练。当前已评估 {n_eval} 个架构，需要至少 {min_samples} 个样本才能训练。")
+                if n_eval < min_samples:
+                    st.progress(n_eval / min_samples)
+                    st.caption(f"代理模型训练进度: {n_eval}/{min_samples} ({n_eval/min_samples*100:.1f}%)")
+                else:
+                    st.caption("样本已满足要求，继续运行实验时代理模型将自动训练。")
+            elif len(result.all_evaluated) < 10:
+                st.warning(f"⚠️ 已评估架构数量过少（{len(result.all_evaluated)}个），无法进行有效的训练/验证集分割。")
+                st.info("💡 提示：需要至少10个已评估架构才能计算预测性能指标（R²、MAPE等）。")
             else:
                 with st.spinner("正在计算预测分析指标..."):
                     val_metrics = exp.surrogate.compute_validation_metrics(result.all_evaluated, train_ratio=0.8)
@@ -793,12 +818,35 @@ def view_experiment_page():
                 actually_eval_list = [gen.actually_evaluated for gen in result.generations]
                 skipped_list = [gen.surrogate_skipped for gen in result.generations]
 
-                total_eval = sum(actually_eval_list)
-                total_skip = sum(skipped_list)
+                total_eval_from_snap = sum(actually_eval_list)
+                total_skip_from_snap = sum(skipped_list)
+                total_eval_reliable = len(result.all_evaluated)
+                pop_size_cfg = config.pop_size
+
+                if total_eval_from_snap == 0 and total_eval_reliable > 0:
+                    actually_eval_list = [pop_size_cfg] * len(gens_list)
+                    skipped_list = [0] * len(gens_list)
+                    total_eval_from_snap = total_eval_reliable
+                    total_skip_from_snap = 0
+                    st.caption("ℹ️ 该实验为历史数据，效率统计中每代评估数按种群大小估算。")
+
+                total_eval = max(total_eval_from_snap, total_eval_reliable)
+                total_skip = total_skip_from_snap
                 total_candidates = total_eval + total_skip
                 savings_percent = (total_skip / total_candidates * 100) if total_candidates > 0 else 0.0
-                final_hv = result.hypervolume_history[-1] if result.hypervolume_history else 0.0
-                hv_per_eval = (final_hv / total_eval) if total_eval > 0 else 0.0
+
+                all_points = result.get_all_points()
+                if len(all_points) > 0:
+                    try:
+                        from src.metrics import get_reference_point as grp, hypervolume as hv_func
+                        ref_pt = grp(all_points, MAXIMIZE)
+                        global_hv = hv_func(all_points, ref_pt, MAXIMIZE)
+                    except:
+                        global_hv = result.hypervolume_history[-1] if result.hypervolume_history else 0.0
+                else:
+                    global_hv = result.hypervolume_history[-1] if result.hypervolume_history else 0.0
+
+                hv_per_eval = (global_hv / total_eval) if total_eval > 0 else 0.0
 
                 metric_cols = st.columns(4)
                 with metric_cols[0]:
@@ -809,8 +857,16 @@ def view_experiment_page():
                     st.metric("累计节省评估", f"{savings_percent:.1f}%",
                              delta=f"节省 {total_skip} 次评估")
                 with metric_cols[3]:
-                    st.metric("搜索效率 (HV/评估)", f"{hv_per_eval:.6f}",
-                             help="最终超体积 / 总评估次数 = 每次评估的平均HV贡献")
+                    if hv_per_eval == 0.0:
+                        display_val = "—"
+                    elif hv_per_eval < 1e-4:
+                        display_val = f"{hv_per_eval:.2e}"
+                    else:
+                        display_val = f"{hv_per_eval:.6f}"
+                    st.metric("搜索效率 (HV/评估)", display_val,
+                             help="全局超体积 / 总评估次数 = 每次评估的平均HV贡献")
+                    if hv_per_eval == 0.0 and global_hv > 0 and total_eval > 0:
+                        st.caption(f"DEBUG: HV={global_hv:.6f}, Eval={total_eval}, 比值={global_hv/total_eval}")
 
                 st.markdown("### 📊 每代评估架构数 vs 代理跳过数")
                 fig_eff = plot_eval_efficiency_bar(

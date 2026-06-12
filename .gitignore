@@ -26,6 +26,10 @@ venv/
 .venv/
 *.egg-info/
 
+# Data
+data/
+experiments/
+
 # Go
 /vendor/
 

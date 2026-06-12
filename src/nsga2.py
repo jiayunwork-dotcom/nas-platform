@@ -276,6 +276,8 @@ class NSGAII:
             child1, child2 = self.crossover(parent1, parent2)
             child1 = self.mutate(child1)
             child2 = self.mutate(child2)
+            _, child1 = validate_architecture(child1, fix=True)
+            _, child2 = validate_architecture(child2, fix=True)
             new_pop.extend([child1, child2])
 
         return new_pop[:self.pop_size]

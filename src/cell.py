@@ -29,17 +29,23 @@ AVAILABLE_OPS = {
     ),
     'max_pool3x3': lambda C_in, C_out, stride: nn.Sequential(
         nn.MaxPool2d(3, stride, padding=1),
-        nn.BatchNorm2d(C_out) if stride == 1 else nn.Identity()
+        nn.Sequential(
+            nn.Conv2d(C_in, C_out, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(C_out),
+        ) if (C_in != C_out or stride != 1) else nn.BatchNorm2d(C_out)
     ),
     'avg_pool3x3': lambda C_in, C_out, stride: nn.Sequential(
         nn.AvgPool2d(3, stride, padding=1, count_include_pad=False),
-        nn.BatchNorm2d(C_out) if stride == 1 else nn.Identity()
+        nn.Sequential(
+            nn.Conv2d(C_in, C_out, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(C_out),
+        ) if (C_in != C_out or stride != 1) else nn.BatchNorm2d(C_out)
     ),
     'skip_connect': lambda C_in, C_out, stride: nn.Identity() if (C_in == C_out and stride == 1) else nn.Sequential(
         nn.Conv2d(C_in, C_out, 1, stride, padding=0, bias=False),
         nn.BatchNorm2d(C_out)
     ),
-    'zero': lambda C_in, C_out, stride: Zero(stride),
+    'zero': lambda C_in, C_out, stride: Zero(stride, C_in, C_out),
 }
 
 OP_NAMES = ['conv3x3', 'conv5x5', 'dil_conv3x3', 'max_pool3x3', 'avg_pool3x3', 'skip_connect', 'zero']
@@ -55,12 +61,24 @@ OP_COLORS = {
 
 
 class Zero(nn.Module):
-    def __init__(self, stride):
+    def __init__(self, stride, C_in=None, C_out=None):
         super().__init__()
         self.stride = stride
+        self.C_in = C_in
+        self.C_out = C_out
+        if C_in is not None and C_out is not None and C_in != C_out:
+            self.channel_proj = nn.Sequential(
+                nn.Conv2d(C_in, C_out, 1, stride, padding=0, bias=False),
+                nn.BatchNorm2d(C_out)
+            )
+        else:
+            self.channel_proj = None
 
     def forward(self, x):
         n, c, h, w = x.size()
+        if self.channel_proj is not None:
+            out = self.channel_proj(x)
+            return torch.zeros_like(out)
         return torch.zeros(n, c, h // self.stride, w // self.stride, device=x.device)
 
 
@@ -96,21 +114,23 @@ class Cell(nn.Module):
 
     def build_edges(self, adjacency: np.ndarray, op_list: List[int], C_in_prev_prev: int, C_in_prev: int):
         """根据邻接矩阵和操作列表构建边"""
-        stride = 2 if self.reduction else 1
         C_out = self.C
 
-        self._preprocess0 = ConvBnRelu(C_in_prev_prev, C_out, 1, 1, 0)
-        self._preprocess1 = ConvBnRelu(C_in_prev, C_out, 1, 1, 0)
+        if self.reduction:
+            self._preprocess0 = ConvBnRelu(C_in_prev_prev, C_out, 1, 2, 0)
+            self._preprocess1 = ConvBnRelu(C_in_prev, C_out, 1, 2, 0)
+        else:
+            self._preprocess0 = ConvBnRelu(C_in_prev_prev, C_out, 1, 1, 0)
+            self._preprocess1 = ConvBnRelu(C_in_prev, C_out, 1, 1, 0)
 
         self._ops = nn.ModuleList()
         op_idx_ptr = 0
         for i in range(self.num_nodes):
             for j in range(i + 1, self.num_nodes):
                 if adjacency[i, j]:
-                    stride_edge = stride if (i < 2 and self.reduction) else 1
                     if op_idx_ptr < len(op_list):
                         op_name = self.enabled_ops[op_list[op_idx_ptr]]
-                        op = AVAILABLE_OPS[op_name](C_out, C_out, stride_edge)
+                        op = AVAILABLE_OPS[op_name](C_out, C_out, stride=1)
                         self._ops.append(op)
                     op_idx_ptr += 1
 
@@ -179,6 +199,7 @@ class NASNetwork(nn.Module):
 
         self.cells = nn.ModuleList()
         C_prev_prev, C_prev, C_curr = init_channels * 3, init_channels * 3, init_channels
+        prev_reduction = False
 
         for cell_idx in range(num_cells):
             reduction = cell_idx in [num_cells // 3, 2 * num_cells // 3]
@@ -186,7 +207,12 @@ class NASNetwork(nn.Module):
                 C_curr *= 2
             cell = Cell(num_nodes, C_curr, reduction, enabled_ops)
             self.cells.append(cell)
-            C_prev_prev, C_prev = C_prev, C_curr
+            if reduction or prev_reduction:
+                C_prev_prev, C_prev = C_curr, C_curr
+                prev_reduction = reduction
+            else:
+                C_prev_prev, C_prev = C_prev, C_curr
+                prev_reduction = reduction
 
         self.global_pooling = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Linear(C_prev, num_classes)
@@ -195,6 +221,7 @@ class NASNetwork(nn.Module):
                       reduce_adj: np.ndarray, reduce_ops: List[int]):
         """根据架构编码构建完整网络"""
         C_prev_prev, C_prev, C_curr = self.init_channels * 3, self.init_channels * 3, self.init_channels
+        prev_reduction = False
 
         for cell_idx, cell in enumerate(self.cells):
             reduction = cell_idx in [self.num_cells // 3, 2 * self.num_cells // 3]
@@ -203,14 +230,26 @@ class NASNetwork(nn.Module):
                 cell.build_edges(reduce_adj, reduce_ops, C_prev_prev, C_prev)
             else:
                 cell.build_edges(normal_adj, normal_ops, C_prev_prev, C_prev)
-            C_prev_prev, C_prev = C_prev, C_curr
+            if reduction or prev_reduction:
+                C_prev_prev, C_prev = C_curr, C_curr
+                prev_reduction = reduction
+            else:
+                C_prev_prev, C_prev = C_prev, C_curr
+                prev_reduction = reduction
 
     def forward(self, x, normal_adj: np.ndarray, reduce_adj: np.ndarray):
         s0 = s1 = self.stem(x)
+        prev_reduction = False
         for cell_idx, cell in enumerate(self.cells):
             reduction = cell_idx in [self.num_cells // 3, 2 * self.num_cells // 3]
             adj = reduce_adj if reduction else normal_adj
-            s0, s1 = s1, cell(s0, s1, adj)
+            cell_out = cell(s0, s1, adj)
+            if reduction or prev_reduction:
+                s0, s1 = cell_out, cell_out
+                prev_reduction = reduction
+            else:
+                s0, s1 = s1, cell_out
+                prev_reduction = reduction
         out = self.global_pooling(s1)
         logits = self.classifier(out.view(out.size(0), -1))
         return logits
