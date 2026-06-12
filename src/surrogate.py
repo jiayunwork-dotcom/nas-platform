@@ -1,6 +1,7 @@
 """
 代理模型模块
 使用3层MLP预筛候选架构，减少昂贵评估次数
+扩展: Bootstrap不确定度估计、R²/MAPE计算、学习曲线
 """
 
 import numpy as np
@@ -9,7 +10,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-from typing import List, Tuple, Optional
+from sklearn.metrics import r2_score, mean_absolute_percentage_error
+from typing import List, Tuple, Optional, Dict
 import copy
 
 from .cell import Architecture
@@ -225,3 +227,245 @@ class SurrogateModel:
         rmse = np.sqrt(np.mean((predictions - targets) ** 2, axis=0))
 
         return mae, rmse
+
+    def _train_single_model(self, X_train: np.ndarray, y_train: np.ndarray) -> Tuple[SurrogateMLP, StandardScaler, StandardScaler]:
+        """训练单个MLP模型"""
+        scaler_X = StandardScaler()
+        scaler_y = StandardScaler()
+
+        X_scaled = scaler_X.fit_transform(X_train)
+        y_scaled = scaler_y.fit_transform(y_train)
+
+        dataset = ArchDataset(X_scaled, y_scaled)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        model = SurrogateMLP(self.input_dim, self.hidden_dim).to(self.device)
+        optimizer = optim.Adam(model.parameters(), lr=self.lr)
+        criterion = nn.MSELoss()
+
+        model.train()
+        for epoch in range(self.epochs):
+            for batch_X, batch_y in loader:
+                batch_X = batch_X.to(self.device)
+                batch_y = batch_y.to(self.device)
+                optimizer.zero_grad()
+                outputs = model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+
+        return model, scaler_X, scaler_y
+
+    def _predict_with_model(self, model: SurrogateMLP, scaler_X: StandardScaler,
+                            scaler_y: StandardScaler, X: np.ndarray) -> np.ndarray:
+        """使用指定模型进行预测"""
+        model.eval()
+        X_scaled = scaler_X.transform(X)
+        with torch.no_grad():
+            X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+            y_pred_scaled = model(X_tensor).cpu().numpy()
+        y_pred = scaler_y.inverse_transform(y_pred_scaled)
+        y_pred[:, 0] = np.clip(y_pred[:, 0], 0.0, 1.0)
+        y_pred[:, 1] = np.clip(y_pred[:, 1], 1e3, None)
+        y_pred[:, 2] = np.clip(y_pred[:, 2], 0.0, None)
+        return y_pred
+
+    def split_train_val_by_time(self, evaluated_archs: List[Architecture],
+                                 train_ratio: float = 0.8) -> Tuple[List[Architecture], List[Architecture]]:
+        """
+        按时间顺序分割训练集和验证集
+        前train_ratio为训练集，后(1-train_ratio)为验证集
+        """
+        n = len(evaluated_archs)
+        split_idx = int(n * train_ratio)
+        train_archs = evaluated_archs[:split_idx]
+        val_archs = evaluated_archs[split_idx:]
+        return train_archs, val_archs
+
+    def compute_validation_metrics(self, evaluated_archs: List[Architecture],
+                                    train_ratio: float = 0.8) -> Dict:
+        """
+        计算代理模型在验证集上的R²和MAPE
+
+        Returns:
+            包含以下键的字典:
+            - r2: [accuracy_r2, params_r2, latency_r2]
+            - mape: [accuracy_mape, params_mape, latency_mape]
+            - train_pred: 训练集预测值
+            - train_true: 训练集真实值
+            - val_pred: 验证集预测值
+            - val_true: 验证集真实值
+            - train_archs: 训练集架构
+            - val_archs: 验证集架构
+        """
+        if len(evaluated_archs) < 10:
+            return {
+                'r2': np.zeros(3),
+                'mape': np.zeros(3),
+                'train_pred': np.array([]),
+                'train_true': np.array([]),
+                'val_pred': np.array([]),
+                'val_true': np.array([]),
+                'train_archs': [],
+                'val_archs': []
+            }
+
+        train_archs, val_archs = self.split_train_val_by_time(evaluated_archs, train_ratio)
+
+        if len(train_archs) < self.min_train_samples:
+            return {
+                'r2': np.zeros(3),
+                'mape': np.zeros(3),
+                'train_pred': np.array([]),
+                'train_true': np.array([]),
+                'val_pred': np.array([]),
+                'val_true': np.array([]),
+                'train_archs': train_archs,
+                'val_archs': val_archs
+            }
+
+        X_train = self._encode_architectures(train_archs)
+        y_train = self._get_targets(train_archs)
+        X_val = self._encode_architectures(val_archs)
+        y_val = self._get_targets(val_archs)
+
+        model, scaler_X, scaler_y = self._train_single_model(X_train, y_train)
+
+        train_pred = self._predict_with_model(model, scaler_X, scaler_y, X_train)
+        val_pred = self._predict_with_model(model, scaler_X, scaler_y, X_val)
+
+        r2_scores = np.zeros(3)
+        mape_scores = np.zeros(3)
+        for dim in range(3):
+            if len(y_val) > 1:
+                try:
+                    r2_scores[dim] = r2_score(y_val[:, dim], val_pred[:, dim])
+                except:
+                    r2_scores[dim] = 0.0
+                try:
+                    mape_scores[dim] = mean_absolute_percentage_error(y_val[:, dim], val_pred[:, dim]) * 100
+                except:
+                    mape_scores[dim] = 0.0
+
+        return {
+            'r2': r2_scores,
+            'mape': mape_scores,
+            'train_pred': train_pred,
+            'train_true': y_train,
+            'val_pred': val_pred,
+            'val_true': y_val,
+            'train_archs': train_archs,
+            'val_archs': val_archs
+        }
+
+    def predict_with_uncertainty(self, archs: List[Architecture],
+                                  n_bootstrap: int = 10) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        使用Bootstrap方法预测并估计不确定度
+
+        Args:
+            archs: 待预测的架构列表
+            n_bootstrap: Bootstrap采样次数（默认10次）
+
+        Returns:
+            (predictions, uncertainties):
+                predictions: 平均预测值 [N, 3]
+                uncertainties: 预测标准差（作为不确定度估计） [N, 3]
+        """
+        if not self.trained or self.X_history is None or len(self.X_history) < self.min_train_samples:
+            if self.trained:
+                predictions = self.predict(archs)
+                return predictions, np.zeros_like(predictions)
+            return np.zeros((len(archs), 3)), np.zeros((len(archs), 3))
+
+        X_query = self._encode_architectures(archs)
+        n_samples = len(self.X_history)
+
+        all_predictions = []
+
+        for b in range(n_bootstrap):
+            bootstrap_indices = np.random.choice(n_samples, size=n_samples, replace=True)
+            X_boot = self.X_history[bootstrap_indices]
+            y_boot = self.y_history[bootstrap_indices]
+
+            try:
+                model, scaler_X, scaler_y = self._train_single_model(X_boot, y_boot)
+                pred = self._predict_with_model(model, scaler_X, scaler_y, X_query)
+                all_predictions.append(pred)
+            except:
+                continue
+
+        if len(all_predictions) == 0:
+            predictions = self.predict(archs)
+            return predictions, np.zeros_like(predictions)
+
+        all_predictions = np.array(all_predictions)
+        predictions = np.mean(all_predictions, axis=0)
+        uncertainties = np.std(all_predictions, axis=0)
+
+        return predictions, uncertainties
+
+    def compute_learning_curve(self, evaluated_archs: List[Architecture],
+                                train_ratio: float = 0.8,
+                                min_samples: int = 10,
+                                step: int = 10) -> Dict:
+        """
+        计算代理模型学习曲线
+        x轴为训练样本数(从min_samples到全部训练数据)，y轴为验证集R²
+
+        Args:
+            evaluated_archs: 所有已评估的架构
+            train_ratio: 训练集比例
+            min_samples: 起始训练样本数
+            step: 训练样本数增量步长
+
+        Returns:
+            包含以下键的字典:
+            - train_sizes: 训练样本数列表
+            - r2_scores: 每个训练样本数对应的R² [N, 3]
+        """
+        if len(evaluated_archs) < min_samples + 5:
+            return {'train_sizes': [], 'r2_scores': np.array([])}
+
+        train_archs, val_archs = self.split_train_val_by_time(evaluated_archs, train_ratio)
+
+        if len(val_archs) == 0 or len(train_archs) < min_samples:
+            return {'train_sizes': [], 'r2_scores': np.array([])}
+
+        X_val = self._encode_architectures(val_archs)
+        y_val = self._get_targets(val_archs)
+
+        max_train = len(train_archs)
+        train_sizes = list(range(min_samples, max_train + 1, step))
+        if train_sizes[-1] != max_train:
+            train_sizes.append(max_train)
+
+        r2_scores = []
+
+        for size in train_sizes:
+            subset_train = train_archs[:size]
+            if len(subset_train) < self.min_train_samples:
+                r2_scores.append(np.zeros(3))
+                continue
+
+            X_train = self._encode_architectures(subset_train)
+            y_train = self._get_targets(subset_train)
+
+            try:
+                model, scaler_X, scaler_y = self._train_single_model(X_train, y_train)
+                val_pred = self._predict_with_model(model, scaler_X, scaler_y, X_val)
+
+                r2 = np.zeros(3)
+                for dim in range(3):
+                    try:
+                        r2[dim] = r2_score(y_val[:, dim], val_pred[:, dim])
+                    except:
+                        r2[dim] = 0.0
+                r2_scores.append(r2)
+            except:
+                r2_scores.append(np.zeros(3))
+
+        return {
+            'train_sizes': train_sizes,
+            'r2_scores': np.array(r2_scores)
+        }

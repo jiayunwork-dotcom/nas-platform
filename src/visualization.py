@@ -675,3 +675,332 @@ def get_arch_rank_and_crowding(points: np.ndarray,
     crowding = distances[front_idx_in_front]
 
     return rank, crowding
+
+
+def plot_prediction_scatter(true_values: np.ndarray, pred_values: np.ndarray,
+                            dim_name: str = '精度',
+                            title: str = '预测值 vs 真实值') -> go.Figure:
+    """
+    绘制代理预测值vs真实值散点图，带y=x参考线
+
+    Args:
+        true_values: 真实值数组 [N]
+        pred_values: 预测值数组 [N]
+        dim_name: 维度名称
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    fig = go.Figure()
+
+    min_val = min(np.min(true_values), np.min(pred_values))
+    max_val = max(np.max(true_values), np.max(pred_values))
+    padding = (max_val - min_val) * 0.05
+    min_val -= padding
+    max_val += padding
+
+    fig.add_trace(go.Scatter(
+        x=[min_val, max_val],
+        y=[min_val, max_val],
+        mode='lines',
+        line=dict(color='red', dash='dash', width=2),
+        name='y=x (完美预测)'
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=true_values,
+        y=pred_values,
+        mode='markers',
+        marker=dict(size=8, color='#1f77b4', opacity=0.7,
+                    line=dict(width=1, color='white')),
+        name='数据点',
+        hovertemplate=f'真实值: %{{x:.4f}}<br>预测值: %{{y:.4f}}<br>'
+    ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title=f'真实{dim_name}',
+        yaxis_title=f'预测{dim_name}',
+        template='plotly_white',
+        width=550,
+        height=500,
+        legend=dict(x=0.01, y=0.99)
+    )
+
+    return fig
+
+
+def plot_pareto_with_uncertainty(points: np.ndarray, uncertainties: np.ndarray,
+                                  maximize: List[bool],
+                                  x_dim: int = 1, y_dim: int = 0,
+                                  x_label: str = '参数量', y_label: str = '精度',
+                                  title: str = '帕累托前沿 (点大小=不确定度)') -> go.Figure:
+    """
+    绘制帕累托图，用点大小编码不确定度
+
+    Args:
+        points: 目标值矩阵 [N, 3]
+        uncertainties: 不确定度矩阵 [N, 3]，使用综合不确定度
+        maximize: 各目标是否最大化
+        x_dim: x轴维度索引
+        y_dim: y轴维度索引
+        x_label: x轴标签
+        y_label: y轴标签
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    pareto_indices = get_pareto_front_indices(points, maximize)
+    pareto_mask = np.zeros(len(points), dtype=bool)
+    pareto_mask[pareto_indices] = True
+
+    avg_uncertainty = np.mean(uncertainties, axis=1) if uncertainties.ndim > 1 else uncertainties
+
+    if len(avg_uncertainty) > 0 and np.max(avg_uncertainty) > 0:
+        marker_sizes = 5 + 20 * (avg_uncertainty / np.max(avg_uncertainty))
+    else:
+        marker_sizes = np.full(len(points), 8.0)
+
+    fig = go.Figure()
+
+    dominated_x = points[~pareto_mask, x_dim]
+    dominated_y = points[~pareto_mask, y_dim]
+    dominated_sizes = marker_sizes[~pareto_mask]
+    dominated_unc = avg_uncertainty[~pareto_mask]
+    if len(dominated_x) > 0:
+        fig.add_trace(go.Scatter(
+            x=dominated_x,
+            y=dominated_y,
+            mode='markers',
+            marker=dict(color='#888888', size=dominated_sizes, opacity=0.6,
+                        line=dict(width=1, color='white')),
+            name='被支配解',
+            hovertemplate=f'{x_label}: %{{x:.4f}}<br>{y_label}: %{{y:.4f}}<br>不确定度: %{{text:.4f}}',
+            text=dominated_unc
+        ))
+
+    pareto_x = points[pareto_mask, x_dim]
+    pareto_y = points[pareto_mask, y_dim]
+    pareto_sizes = marker_sizes[pareto_mask]
+    pareto_unc = avg_uncertainty[pareto_mask]
+    if len(pareto_x) > 0:
+        sort_idx = np.argsort(pareto_x)
+        fig.add_trace(go.Scatter(
+            x=pareto_x[sort_idx],
+            y=pareto_y[sort_idx],
+            mode='lines+markers',
+            marker=dict(color='#FF4444', size=pareto_sizes[sort_idx],
+                        line=dict(width=2, color='white')),
+            line=dict(color='#FF4444', width=2),
+            name='帕累托非支配解',
+            hovertemplate=f'{x_label}: %{{x:.4f}}<br>{y_label}: %{{y:.4f}}<br>不确定度: %{{text:.4f}}',
+            text=pareto_unc[sort_idx]
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        template='plotly_white',
+        width=650,
+        height=550,
+        legend=dict(x=0.01, y=0.99)
+    )
+
+    return fig
+
+
+def plot_surrogate_learning_curve(train_sizes: List[int], r2_scores: np.ndarray,
+                                   target_names: List[str] = ['精度', '参数量', '延迟'],
+                                   title: str = '代理模型学习曲线') -> go.Figure:
+    """
+    绘制代理模型学习曲线
+
+    Args:
+        train_sizes: 训练样本数列表
+        r2_scores: R²分数 [N, 3]
+        target_names: 各目标维度名称
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    fig = go.Figure()
+
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+
+    for dim in range(min(3, r2_scores.shape[1])):
+        fig.add_trace(go.Scatter(
+            x=train_sizes,
+            y=r2_scores[:, dim],
+            mode='lines+markers',
+            marker=dict(size=8),
+            line=dict(width=3, color=colors[dim % len(colors)]),
+            name=f'{target_names[dim]} R²'
+        ))
+
+    fig.add_hline(
+        y=0.0,
+        line_dash='dash',
+        line_color='gray',
+        line_width=1
+    )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='训练样本数',
+        yaxis_title='验证集 R² 决定系数',
+        template='plotly_white',
+        width=700,
+        height=450,
+        legend=dict(x=0.01, y=0.99)
+    )
+
+    return fig
+
+
+def plot_eval_efficiency_bar(generations: List[int], actually_evaluated: List[int],
+                              surrogate_skipped: List[int],
+                              title: str = '每代评估架构数 vs 代理跳过数') -> go.Figure:
+    """
+    绘制每代实际评估数vs代理跳过数的堆叠柱状图
+
+    Args:
+        generations: 代数列表
+        actually_evaluated: 每代实际评估数
+        surrogate_skipped: 每代代理跳过数
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=generations,
+        y=actually_evaluated,
+        name='实际评估',
+        marker_color='#1f77b4'
+    ))
+
+    fig.add_trace(go.Bar(
+        x=generations,
+        y=surrogate_skipped,
+        name='代理跳过',
+        marker_color='#ff7f0e'
+    ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='代数',
+        yaxis_title='架构数',
+        barmode='stack',
+        template='plotly_white',
+        width=700,
+        height=450,
+        legend=dict(x=0.01, y=0.99)
+    )
+
+    return fig
+
+
+def plot_strategy_duration_pie(strategy_durations: Dict[str, float],
+                                title: str = '各评估策略使用时长占比') -> go.Figure:
+    """
+    绘制评估策略使用时长饼图
+
+    Args:
+        strategy_durations: {策略名: 时长}字典
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    strategy_display_names = {
+        'fast': '快速代理',
+        'synflow': 'SynFlow零代价',
+        'naswot': 'NASWOT零代价',
+        'weight_sharing': '权重共享',
+        'full': '完整训练'
+    }
+
+    labels = [strategy_display_names.get(k, k) for k in strategy_durations.keys()]
+    values = list(strategy_durations.values())
+
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        hole=0.4,
+        marker=dict(colors=colors[:len(labels)]),
+        textinfo='label+percent',
+        insidetextorientation='radial'
+    )])
+
+    fig.update_layout(
+        title=title,
+        template='plotly_white',
+        width=550,
+        height=500
+    )
+
+    return fig
+
+
+def plot_param_diversity_curve(generations: List[int], diversities: List[float],
+                                mutation_rates: List[float], crossover_rates: List[float],
+                                title: str = '种群多样性与进化参数变化') -> go.Figure:
+    """
+    绘制种群多样性、变异率、交叉率随代数变化的曲线
+
+    Args:
+        generations: 代数列表
+        diversities: 每代多样性值
+        mutation_rates: 每代变异率
+        crossover_rates: 每代交叉率
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(
+        go.Scatter(x=generations, y=diversities, mode='lines+markers',
+                   name='多样性', line=dict(color='#1f77b4', width=3), marker=dict(size=8)),
+        secondary_y=False,
+    )
+
+    fig.add_trace(
+        go.Scatter(x=generations, y=mutation_rates, mode='lines+markers',
+                   name='变异率', line=dict(color='#ff7f0e', width=2, dash='dash'), marker=dict(size=6)),
+        secondary_y=True,
+    )
+
+    fig.add_trace(
+        go.Scatter(x=generations, y=crossover_rates, mode='lines+markers',
+                   name='交叉率', line=dict(color='#2ca02c', width=2, dash='dot'), marker=dict(size=6)),
+        secondary_y=True,
+    )
+
+    fig.add_hline(y=0.3, line_dash='dash', line_color='red', line_width=1,
+                  annotation_text='低多样性阈值(0.3)', secondary_y=False)
+    fig.add_hline(y=0.7, line_dash='dash', line_color='green', line_width=1,
+                  annotation_text='高多样性阈值(0.7)', secondary_y=False)
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='代数',
+        template='plotly_white',
+        width=700,
+        height=450,
+        legend=dict(x=0.01, y=0.99)
+    )
+
+    fig.update_yaxes(title_text='多样性 (0~1)', secondary_y=False, range=[0, 1])
+    fig.update_yaxes(title_text='进化参数概率', secondary_y=True, range=[0, 1])
+
+    return fig

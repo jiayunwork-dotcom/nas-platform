@@ -28,7 +28,10 @@ from src.visualization import (
     plot_network_architecture, create_pareto_animation,
     plot_operations_legend, get_pareto_front_indices,
     plot_adjacency_heatmap, plot_hypervolume_curve_with_convergence,
-    detect_convergence, get_arch_rank_and_crowding
+    detect_convergence, get_arch_rank_and_crowding,
+    plot_prediction_scatter, plot_pareto_with_uncertainty,
+    plot_surrogate_learning_curve, plot_eval_efficiency_bar,
+    plot_strategy_duration_pie, plot_param_diversity_curve
 )
 from src.metrics import count_architecture_flops, hypervolume, get_reference_point
 
@@ -337,6 +340,18 @@ def create_experiment_page():
             surrogate_min_samples = 50
             surrogate_percentile = 30.0
 
+        st.subheader("🧠 自适应调度")
+
+        use_adaptive = st.checkbox("启用自适应调度", value=True,
+                                  help="根据搜索过程实时反馈自动切换评估策略和调整进化参数")
+        if use_adaptive:
+            st.caption("✅ 自适应调度将:")
+            st.caption("• 前5代使用SynFlow快速筛选，积累初始样本")
+            st.caption("• 第6代起代理就绪后切换为代理预筛+快速评估混合模式")
+            st.caption("• 连续3代HV增长率<5%时自动升级评估精度")
+            st.caption("• 帕累托解减少>20%时触发多样性警报并强制校准")
+            st.caption("• 根据种群多样性动态调整变异/交叉概率")
+
     st.markdown("---")
 
     col_start, col_preview, _ = st.columns([1, 1, 1])
@@ -359,6 +374,7 @@ def create_experiment_page():
                 use_surrogate=use_surrogate,
                 surrogate_min_samples=surrogate_min_samples,
                 surrogate_percentile=surrogate_percentile,
+                use_adaptive_scheduling=use_adaptive,
                 device=device
             )
 
@@ -464,7 +480,7 @@ def view_experiment_page():
 
         st.subheader(f"📈 第 {current_gen} 代种群状态")
 
-        metric_cols = st.columns(4)
+        metric_cols = st.columns(6)
         with metric_cols[0]:
             st.metric("超体积", f"{snapshot.hypervolume:.4f}")
         with metric_cols[1]:
@@ -473,11 +489,24 @@ def view_experiment_page():
             st.metric("平均参数量", f"{snapshot.avg_params/1e6:.2f}M")
         with metric_cols[3]:
             st.metric("平均延迟", f"{snapshot.avg_latency:.3f}ms")
+        with metric_cols[4]:
+            st.metric("🧬 多样性", f"{snapshot.diversity:.3f}")
+            if snapshot.diversity < 0.3:
+                st.caption("⚠️ 低多样性")
+            elif snapshot.diversity > 0.7:
+                st.caption("✅ 高多样性")
+        with metric_cols[5]:
+            strategy_display = EVAL_STRATEGIES.get(snapshot.eval_strategy, snapshot.eval_strategy)
+            st.metric("🔄 评估策略", strategy_display.split(' ')[0])
+            st.caption(f"变异率: {snapshot.mutation_rate:.3f} | 交叉率: {snapshot.crossover_rate:.3f}")
 
         if snapshot.surrogate_used:
-            st.success("🤖 本代使用了代理模型预筛")
+            st.success(f"🤖 本代使用了代理模型预筛 - 实际评估: {snapshot.actually_evaluated}, 代理跳过: {snapshot.surrogate_skipped}")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["🎯 帕累托前沿 2D", "🌐 帕累托前沿 3D", "📐 架构详情", "📊 历史曲线"])
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+            "🎯 帕累托前沿 2D", "🌐 帕累托前沿 3D", "📐 架构详情",
+            "📊 历史曲线", "🧠 预测分析", "📊 效率统计", "📜 策略日志"
+        ])
 
         with tab1:
             st.info("💡 点击散点图上的任意点查看该架构的详细信息")
@@ -650,6 +679,201 @@ def view_experiment_page():
                     x_label='参数量', y_label='精度'
                 )
                 st.plotly_chart(anim_fig, use_container_width=True)
+
+            if len(result.generations) > 1:
+                st.subheader("🧬 种群多样性与进化参数变化")
+                gens_list = list(range(len(result.generations)))
+                div_list = [gen.diversity for gen in result.generations]
+                mut_list = [gen.mutation_rate for gen in result.generations]
+                cross_list = [gen.crossover_rate for gen in result.generations]
+                param_fig = plot_param_diversity_curve(
+                    gens_list, div_list, mut_list, cross_list,
+                    title='种群多样性与进化参数随代数变化'
+                )
+                st.plotly_chart(param_fig, use_container_width=True)
+
+        with tab5:
+            st.subheader("🧠 代理模型性能预测置信度分析")
+
+            if exp.surrogate is None or not exp.surrogate.trained:
+                st.info("🤖 代理模型尚未训练或未启用，暂无预测分析数据。")
+            else:
+                with st.spinner("正在计算预测分析指标..."):
+                    val_metrics = exp.surrogate.compute_validation_metrics(result.all_evaluated, train_ratio=0.8)
+
+                    st.markdown("### 📊 验证集预测性能指标")
+                    metric_cols = st.columns(3)
+                    target_names = ['精度', '参数量', '延迟']
+                    for i, name in enumerate(target_names):
+                        with metric_cols[i]:
+                            st.metric(
+                                f"{name} R²",
+                                f"{val_metrics['r2'][i]:.4f}",
+                                delta=f"MAPE: {val_metrics['mape'][i]:.2f}%"
+                            )
+
+                    st.markdown("### 📈 预测值 vs 真实值散点图")
+                    if len(val_metrics['val_true']) > 0:
+                        scatter_cols = st.columns(3)
+                        dim_info = [
+                            (0, '精度', 'accuracy'),
+                            (1, '参数量', 'params'),
+                            (2, '延迟 (ms)', 'latency')
+                        ]
+                        for idx, (dim, name, _) in enumerate(dim_info):
+                            with scatter_cols[idx]:
+                                true_vals = val_metrics['val_true'][:, dim]
+                                pred_vals = val_metrics['val_pred'][:, dim]
+                                if dim == 1:
+                                    true_vals = true_vals / 1e6
+                                    pred_vals = pred_vals / 1e6
+                                    name_display = f'{name} (M)'
+                                else:
+                                    name_display = name
+                                fig_scatter = plot_prediction_scatter(
+                                    true_vals, pred_vals,
+                                    dim_name=name_display,
+                                    title=f'{name_display} 预测 vs 真实'
+                                )
+                                st.plotly_chart(fig_scatter, use_container_width=True)
+                    else:
+                        st.info("验证集样本不足，无法绘制散点图。")
+
+                    st.markdown("### 🎯 带不确定度的帕累托前沿")
+                    st.caption("点大小代表预测不确定度（大点=不确定度高，小点=预测可靠）")
+
+                    last_snapshot = result.generations[-1]
+                    last_pop = last_snapshot.population
+                    last_points = last_snapshot.get_fitness_matrix()
+
+                    if exp.surrogate.trained:
+                        _, uncertainties = exp.surrogate.predict_with_uncertainty(last_pop, n_bootstrap=10)
+
+                        pareto_unc_cols = st.columns(2)
+                        with pareto_unc_cols[0]:
+                            fig_unc1 = plot_pareto_with_uncertainty(
+                                last_points, uncertainties, MAXIMIZE,
+                                x_dim=1, y_dim=0,
+                                x_label='参数量', y_label='精度',
+                                title='精度 vs 参数量 (大小=不确定度)'
+                            )
+                            st.plotly_chart(fig_unc1, use_container_width=True)
+                        with pareto_unc_cols[1]:
+                            fig_unc2 = plot_pareto_with_uncertainty(
+                                last_points, uncertainties, MAXIMIZE,
+                                x_dim=2, y_dim=0,
+                                x_label='延迟 (ms)', y_label='精度',
+                                title='精度 vs 延迟 (大小=不确定度)'
+                            )
+                            st.plotly_chart(fig_unc2, use_container_width=True)
+
+                    st.markdown("### 📉 代理模型学习曲线")
+                    with st.spinner("正在计算学习曲线（可能需要一些时间）..."):
+                        learning_data = exp.surrogate.compute_learning_curve(
+                            result.all_evaluated,
+                            train_ratio=0.8, min_samples=10, step=10
+                        )
+                        if len(learning_data['train_sizes']) > 0:
+                            fig_lc = plot_surrogate_learning_curve(
+                                learning_data['train_sizes'],
+                                learning_data['r2_scores'],
+                                title='代理模型学习曲线 (验证集 R² 随训练样本数变化)'
+                            )
+                            st.plotly_chart(fig_lc, use_container_width=True)
+                        else:
+                            st.info("样本数量不足，无法绘制学习曲线。")
+
+        with tab6:
+            st.subheader("📊 搜索效率统计")
+
+            if len(result.generations) == 0:
+                st.info("暂无效率统计数据。")
+            else:
+                gens_list = list(range(len(result.generations)))
+                actually_eval_list = [gen.actually_evaluated for gen in result.generations]
+                skipped_list = [gen.surrogate_skipped for gen in result.generations]
+
+                total_eval = sum(actually_eval_list)
+                total_skip = sum(skipped_list)
+                total_candidates = total_eval + total_skip
+                savings_percent = (total_skip / total_candidates * 100) if total_candidates > 0 else 0.0
+                final_hv = result.hypervolume_history[-1] if result.hypervolume_history else 0.0
+                hv_per_eval = (final_hv / total_eval) if total_eval > 0 else 0.0
+
+                metric_cols = st.columns(4)
+                with metric_cols[0]:
+                    st.metric("总候选架构数", total_candidates)
+                with metric_cols[1]:
+                    st.metric("实际评估数", total_eval, delta=f"跳过 {total_skip}")
+                with metric_cols[2]:
+                    st.metric("累计节省评估", f"{savings_percent:.1f}%",
+                             delta=f"节省 {total_skip} 次评估")
+                with metric_cols[3]:
+                    st.metric("搜索效率 (HV/评估)", f"{hv_per_eval:.6f}",
+                             help="最终超体积 / 总评估次数 = 每次评估的平均HV贡献")
+
+                st.markdown("### 📊 每代评估架构数 vs 代理跳过数")
+                fig_eff = plot_eval_efficiency_bar(
+                    gens_list, actually_eval_list, skipped_list,
+                    title='每代实际评估数 vs 代理预筛跳过数'
+                )
+                st.plotly_chart(fig_eff, use_container_width=True)
+
+                st.markdown("### 🥧 各评估策略使用时长占比")
+                strategy_durations = {}
+                for gen in result.generations:
+                    s = gen.eval_strategy
+                    if s not in strategy_durations:
+                        strategy_durations[s] = 0.0
+                    strategy_durations[s] += gen.eval_duration
+
+                if len(strategy_durations) > 0:
+                    fig_pie = plot_strategy_duration_pie(
+                        strategy_durations,
+                        title='各评估策略累计使用时长占比'
+                    )
+                    st.plotly_chart(fig_pie, use_container_width=True)
+
+        with tab7:
+            st.subheader("📜 策略切换日志")
+
+            if not result.strategy_switch_logs:
+                st.info("📭 本次搜索未记录策略切换（自适应调度可能未启用）。")
+            else:
+                st.caption(f"共发生 {len(result.strategy_switch_logs)} 次策略切换")
+
+                switch_data = []
+                for log in result.strategy_switch_logs:
+                    old_display = EVAL_STRATEGIES.get(log.old_strategy, log.old_strategy)
+                    new_display = EVAL_STRATEGIES.get(log.new_strategy, log.new_strategy)
+                    switch_data.append({
+                        '时间': log.timestamp,
+                        '代数': f"第 {log.generation} 代",
+                        '原策略': old_display,
+                        '新策略': new_display,
+                        '切换原因': log.reason
+                    })
+                switch_df = pd.DataFrame(switch_data)
+                st.dataframe(switch_df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            st.subheader("📋 每代参数快照")
+            if len(result.generations) > 0:
+                snapshot_data = []
+                for gen in result.generations:
+                    strat_display = EVAL_STRATEGIES.get(gen.eval_strategy, gen.eval_strategy)
+                    snapshot_data.append({
+                        '代数': gen.generation,
+                        '评估策略': strat_display.split(' ')[0],
+                        '变异率': f"{gen.mutation_rate:.3f}",
+                        '交叉率': f"{gen.crossover_rate:.3f}",
+                        '多样性': f"{gen.diversity:.3f}",
+                        '实际评估': gen.actually_evaluated,
+                        '代理跳过': gen.surrogate_skipped,
+                        '超体积': f"{gen.hypervolume:.4f}"
+                    })
+                snapshot_df = pd.DataFrame(snapshot_data)
+                st.dataframe(snapshot_df, use_container_width=True, hide_index=True)
 
         st.markdown("---")
 

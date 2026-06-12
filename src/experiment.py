@@ -21,6 +21,10 @@ from .metrics import (
     hypervolume, get_reference_point,
     fast_non_dominated_sort, get_pareto_front
 )
+from .adaptive import (
+    AdaptiveScheduler, StrategySwitchLog, GenerationEfficiencyStats,
+    AdaptiveState
+)
 
 
 @dataclass
@@ -45,6 +49,7 @@ class ExperimentConfig:
     surrogate_min_samples: int = 50
     surrogate_percentile: float = 30.0
     device: str = 'cpu'
+    use_adaptive_scheduling: bool = True
     created_at: str = field(default_factory=lambda: datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
     def to_dict(self) -> Dict:
@@ -65,6 +70,13 @@ class GenerationSnapshot:
     avg_params: float
     avg_latency: float
     surrogate_used: bool = False
+    eval_strategy: str = 'fast'
+    mutation_rate: float = 0.1
+    crossover_rate: float = 0.9
+    diversity: float = 0.5
+    actually_evaluated: int = 0
+    surrogate_skipped: int = 0
+    eval_duration: float = 0.0
 
     def get_fitness_matrix(self) -> np.ndarray:
         return np.array([[a.accuracy, a.params, a.latency] for a in self.population])
@@ -78,6 +90,8 @@ class ExperimentResult:
     all_evaluated: List[Architecture] = field(default_factory=list)
     hypervolume_history: List[float] = field(default_factory=list)
     completed: bool = False
+    strategy_switch_logs: List[StrategySwitchLog] = field(default_factory=list)
+    efficiency_stats: List[GenerationEfficiencyStats] = field(default_factory=list)
 
     def get_all_points(self) -> np.ndarray:
         return np.array([[a.accuracy, a.params, a.latency] for a in self.all_evaluated])
@@ -98,13 +112,16 @@ class Experiment:
         self.result = ExperimentResult(config=config)
         self.algorithm = None
         self.evaluator = None
+        self.evaluators: Dict[str, Evaluator] = {}
         self.surrogate = None
         self.random_search_baseline = None
+        self.adaptive_scheduler = None
         self._initialized = False
 
         self._init_algorithm()
-        self._init_evaluator()
+        self._init_evaluators()
         self._init_surrogate()
+        self._init_adaptive_scheduler()
 
     def _init_algorithm(self):
         """初始化进化算法"""
@@ -125,16 +142,27 @@ class Experiment:
         else:
             raise ValueError(f"Unknown algorithm: {self.config.algorithm}")
 
-    def _init_evaluator(self):
-        """初始化评估器"""
-        self.evaluator = get_evaluator(
-            eval_strategy=self.config.eval_strategy,
-            num_classes=10,
-            num_cells=self.config.num_cells,
-            init_channels=self.config.init_channels,
-            device=self.config.device,
-            epochs=self.config.eval_epochs
-        )
+    def _init_evaluators(self):
+        """初始化所有评估器"""
+        all_strategies = ['fast', 'synflow', 'naswot', 'weight_sharing', 'full']
+        for strategy in all_strategies:
+            self.evaluators[strategy] = get_evaluator(
+                eval_strategy=strategy,
+                num_classes=10,
+                num_cells=self.config.num_cells,
+                init_channels=self.config.init_channels,
+                device=self.config.device,
+                epochs=self.config.eval_epochs
+            )
+        self.evaluator = self.evaluators[self.config.eval_strategy]
+
+    def _init_adaptive_scheduler(self):
+        """初始化自适应调度器"""
+        if self.config.use_adaptive_scheduling:
+            self.adaptive_scheduler = AdaptiveScheduler(
+                base_mutation_rate=self.config.mutation_rate,
+                base_crossover_rate=self.config.crossover_rate
+            )
 
     def _init_surrogate(self):
         """初始化代理模型"""
@@ -162,21 +190,48 @@ class Experiment:
         return hypervolume(points, ref_point, [True, False, False])
 
     def _evaluate_population(self, population: List[Architecture],
-                             use_surrogate: bool = False) -> List[Architecture]:
-        """评估种群"""
+                             use_surrogate: bool = False,
+                             eval_strategy: Optional[str] = None) -> Tuple[List[Architecture], int, int, float]:
+        """
+        评估种群
+
+        Args:
+            population: 待评估的架构种群
+            use_surrogate: 是否使用代理模型预筛
+            eval_strategy: 指定使用的评估策略，None则使用默认
+
+        Returns:
+            (population, actually_evaluated, surrogate_skipped, eval_duration)
+        """
+        import time
+
+        strategy = eval_strategy or self.config.eval_strategy
+        evaluator = self.evaluators.get(strategy, self.evaluator)
+
         to_evaluate = population
+        total_candidates = len(population)
+        surrogate_skipped = 0
 
         if use_surrogate and self.surrogate and self.surrogate.is_ready():
-            to_evaluate = self.surrogate.pre_screen(
+            screened = self.surrogate.pre_screen(
                 population,
                 percentile=self.config.surrogate_percentile
             )
+            screened_indices = set(id(a) for a in screened)
+            to_evaluate = [a for a in population if id(a) in screened_indices]
+            surrogate_skipped = total_candidates - len(to_evaluate)
+
+        start_time = time.time()
 
         for arch in to_evaluate:
             if arch.accuracy is None:
-                self.evaluator.evaluate(arch)
+                evaluator.evaluate(arch)
                 arch.is_evaluated = True
                 self.result.all_evaluated.append(arch)
+
+        eval_duration = time.time() - start_time
+
+        actually_evaluated = len(to_evaluate)
 
         for arch in population:
             if arch.accuracy is None:
@@ -184,7 +239,7 @@ class Experiment:
                 arch.params = 1e7
                 arch.latency = 10.0
 
-        return population
+        return population, actually_evaluated, surrogate_skipped, eval_duration
 
     def _update_surrogate(self):
         """更新代理模型"""
@@ -192,7 +247,10 @@ class Experiment:
             self.surrogate.train(self.result.all_evaluated)
 
     def _create_snapshot(self, generation: int, population: List[Architecture],
-                         surrogate_used: bool) -> GenerationSnapshot:
+                         surrogate_used: bool, eval_strategy: str = 'fast',
+                         mutation_rate: float = 0.1, crossover_rate: float = 0.9,
+                         diversity: float = 0.5, actually_evaluated: int = 0,
+                         surrogate_skipped: int = 0, eval_duration: float = 0.0) -> GenerationSnapshot:
         """创建代数快照"""
         evaluated = [a for a in population if a.accuracy is not None]
         if len(evaluated) == 0:
@@ -210,11 +268,18 @@ class Experiment:
             avg_accuracy=avg_acc,
             avg_params=avg_params,
             avg_latency=avg_latency,
-            surrogate_used=surrogate_used
+            surrogate_used=surrogate_used,
+            eval_strategy=eval_strategy,
+            mutation_rate=mutation_rate,
+            crossover_rate=crossover_rate,
+            diversity=diversity,
+            actually_evaluated=actually_evaluated,
+            surrogate_skipped=surrogate_skipped,
+            eval_duration=eval_duration
         )
 
     def run(self, progress_callback: Optional[Callable[[int, int, str], None]] = None):
-        """运行完整搜索"""
+        """运行完整搜索（集成自适应调度）"""
         if self._initialized:
             return
 
@@ -223,36 +288,118 @@ class Experiment:
         if progress_callback:
             progress_callback(0, self.config.num_generations, "初始化种群完成，开始评估...")
 
-        use_surrogate = False
-        population = self._evaluate_population(population, use_surrogate=False)
+        use_adaptive = self.config.use_adaptive_scheduling and self.adaptive_scheduler is not None
 
-        snapshot = self._create_snapshot(0, population, surrogate_used=False)
+        current_strategy = self.config.eval_strategy
+        current_mut = self.config.mutation_rate
+        current_cross = self.config.crossover_rate
+        current_diversity = 0.5
+
+        if use_adaptive:
+            current_strategy = self.adaptive_scheduler.state.current_eval_strategy
+
+        population, actually_eval, skipped, eval_dur = self._evaluate_population(
+            population, use_surrogate=False, eval_strategy=current_strategy
+        )
+
+        snapshot = self._create_snapshot(
+            0, population, surrogate_used=False,
+            eval_strategy=current_strategy,
+            mutation_rate=current_mut, crossover_rate=current_cross,
+            diversity=current_diversity,
+            actually_evaluated=actually_eval, surrogate_skipped=skipped,
+            eval_duration=eval_dur
+        )
         self.result.generations.append(snapshot)
         self.result.hypervolume_history.append(snapshot.hypervolume)
+
+        if use_adaptive:
+            gen_stats = GenerationEfficiencyStats(
+                generation=0, total_candidates=len(population),
+                actually_evaluated=actually_eval, surrogate_skipped=skipped,
+                eval_strategy=current_strategy, eval_duration=eval_dur
+            )
+            self.adaptive_scheduler.record_efficiency_stats(gen_stats)
 
         for gen in range(1, self.config.num_generations + 1):
             if progress_callback:
                 progress_callback(gen, self.config.num_generations, f"运行第 {gen} 代...")
 
+            if use_adaptive:
+                current_diversity = self.adaptive_scheduler.state.current_diversity
+                current_mut, current_cross = self.adaptive_scheduler.update_evolution_params(population)
+                self.algorithm.mutation_rate = current_mut
+                self.algorithm.crossover_rate = current_cross
+
             offspring = self.algorithm.make_new_population(population)
+
+            if use_adaptive:
+                surrogate_ready = (self.surrogate is not None and
+                                   len(self.result.all_evaluated) >= self.config.surrogate_min_samples
+                                   and self.surrogate.trained)
+                self.adaptive_scheduler.update_eval_strategy(
+                    gen, population, self.result.hypervolume_history, surrogate_ready
+                )
+                current_strategy = self.adaptive_scheduler.state.current_eval_strategy
+
+                if self.adaptive_scheduler.check_diversity_alarm():
+                    if progress_callback:
+                        progress_callback(gen, self.config.num_generations,
+                                         f"第 {gen} 代: 触发多样性警报，对帕累托前沿解做完整校准评估...")
+                    from .metrics import fast_non_dominated_sort
+                    points = np.array([[a.accuracy, a.params, a.latency] for a in population
+                                       if a.accuracy is not None])
+                    if len(points) > 0:
+                        fronts = fast_non_dominated_sort(points, [True, False, False])
+                        if fronts and len(fronts[0]) > 0:
+                            pareto_archs = [population[i] for i in fronts[0]]
+                            full_evaluator = self.evaluators.get('full', self.evaluator)
+                            for arch in pareto_archs:
+                                full_evaluator.evaluate(arch)
+                                arch.is_evaluated = True
+                                if arch not in self.result.all_evaluated:
+                                    self.result.all_evaluated.append(arch)
 
             use_surrogate = (self.surrogate is not None and
                            len(self.result.all_evaluated) >= self.config.surrogate_min_samples)
 
-            offspring = self._evaluate_population(offspring, use_surrogate=use_surrogate)
+            offspring, actually_eval, skipped, eval_dur = self._evaluate_population(
+                offspring, use_surrogate=use_surrogate, eval_strategy=current_strategy
+            )
 
             population = self.algorithm.step(population, offspring)
 
             self._update_surrogate()
 
-            snapshot = self._create_snapshot(gen, population, surrogate_used=use_surrogate)
+            snapshot = self._create_snapshot(
+                gen, population, surrogate_used=use_surrogate,
+                eval_strategy=current_strategy,
+                mutation_rate=current_mut, crossover_rate=current_cross,
+                diversity=current_diversity,
+                actually_evaluated=actually_eval, surrogate_skipped=skipped,
+                eval_duration=eval_dur
+            )
             self.result.generations.append(snapshot)
             self.result.hypervolume_history.append(snapshot.hypervolume)
+
+            if use_adaptive:
+                gen_stats = GenerationEfficiencyStats(
+                    generation=gen, total_candidates=len(offspring),
+                    actually_evaluated=actually_eval, surrogate_skipped=skipped,
+                    eval_strategy=current_strategy, eval_duration=eval_dur
+                )
+                self.adaptive_scheduler.record_efficiency_stats(gen_stats)
 
             if progress_callback:
                 progress_callback(gen, self.config.num_generations,
                                 f"第 {gen} 代完成 - HV: {snapshot.hypervolume:.4f}, "
-                                f"平均精度: {snapshot.avg_accuracy:.4f}")
+                                f"策略: {current_strategy}, "
+                                f"变异率: {current_mut:.3f}, 交叉率: {current_cross:.3f}, "
+                                f"多样性: {current_diversity:.3f}")
+
+        if use_adaptive:
+            self.result.strategy_switch_logs = self.adaptive_scheduler.state.strategy_switch_logs
+            self.result.efficiency_stats = self.adaptive_scheduler.state.efficiency_stats
 
         self.result.completed = True
         self._initialized = True
