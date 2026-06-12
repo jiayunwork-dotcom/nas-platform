@@ -1004,3 +1004,639 @@ def plot_param_diversity_curve(generations: List[int], diversities: List[float],
     fig.update_yaxes(title_text='进化参数概率', secondary_y=True, range=[0, 1])
 
     return fig
+
+
+def get_strategy_segments(generations: List[int], strategies: List[str]) -> List[Dict]:
+    """
+    将每代策略转换为连续的策略段（用于甘特图）
+
+    Args:
+        generations: 代数列表
+        strategies: 每代对应的策略列表
+
+    Returns:
+        策略段列表，每个包含 strategy, start_gen, end_gen
+    """
+    if not strategies:
+        return []
+
+    segments = []
+    current_strategy = strategies[0]
+    start_gen = generations[0]
+
+    for i in range(1, len(strategies)):
+        if strategies[i] != current_strategy:
+            segments.append({
+                'strategy': current_strategy,
+                'start_gen': start_gen,
+                'end_gen': generations[i - 1]
+            })
+            current_strategy = strategies[i]
+            start_gen = generations[i]
+
+    segments.append({
+        'strategy': current_strategy,
+        'start_gen': start_gen,
+        'end_gen': generations[-1]
+    })
+
+    return segments
+
+
+def plot_strategy_timeline(generations: List[int], strategies: List[str],
+                           title: str = '策略切换时间线',
+                           y_position: int = 0) -> go.Figure:
+    """
+    绘制单实验策略切换时间线（甘特图风格）
+
+    Args:
+        generations: 代数列表
+        strategies: 每代对应的策略列表
+        title: 图表标题
+        y_position: y轴位置（用于多个实验并排）
+
+    Returns:
+        plotly Figure
+    """
+    strategy_colors = {
+        'fast': '#1f77b4',
+        'synflow': '#ff7f0e',
+        'naswot': '#2ca02c',
+        'weight_sharing': '#d62728',
+        'full': '#9467bd'
+    }
+
+    strategy_display_names = {
+        'fast': '快速代理',
+        'synflow': 'SynFlow',
+        'naswot': 'NASWOT',
+        'weight_sharing': '权重共享',
+        'full': '完整训练'
+    }
+
+    segments = get_strategy_segments(generations, strategies)
+
+    fig = go.Figure()
+
+    for seg in segments:
+        strategy = seg['strategy']
+        color = strategy_colors.get(strategy, '#888888')
+        display_name = strategy_display_names.get(strategy, strategy)
+
+        fig.add_trace(go.Bar(
+            x=[seg['end_gen'] - seg['start_gen'] + 1],
+            y=[y_position],
+            base=[seg['start_gen'] - 0.5],
+            orientation='h',
+            marker=dict(color=color, line=dict(color='white', width=2)),
+            name=display_name,
+            text=f"{display_name}<br>第{seg['start_gen']}~{seg['end_gen']}代",
+            hoverinfo='text',
+            showlegend=False
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='代数',
+        yaxis=dict(
+            showticklabels=False,
+            showgrid=False,
+            zeroline=False,
+            range=[y_position - 0.5, y_position + 0.5]
+        ),
+        template='plotly_white',
+        height=120,
+        margin=dict(l=10, r=10, t=40, b=10),
+        barmode='stack'
+    )
+
+    return fig
+
+
+def plot_dual_strategy_timeline(exp1_gens: List[int], exp1_strategies: List[str],
+                                exp2_gens: List[int], exp2_strategies: List[str],
+                                exp1_name: str = '实验1', exp2_name: str = '实验2',
+                                title: str = '策略切换时间线对比') -> go.Figure:
+    """
+    绘制两个实验的策略切换时间线对比（并排甘特图）
+
+    Args:
+        exp1_gens, exp1_strategies: 实验1的代数和策略列表
+        exp2_gens, exp2_strategies: 实验2的代数和策略列表
+        exp1_name, exp2_name: 实验名称
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    strategy_colors = {
+        'fast': '#1f77b4',
+        'synflow': '#ff7f0e',
+        'naswot': '#2ca02c',
+        'weight_sharing': '#d62728',
+        'full': '#9467bd'
+    }
+
+    strategy_display_names = {
+        'fast': '快速代理',
+        'synflow': 'SynFlow',
+        'naswot': 'NASWOT',
+        'weight_sharing': '权重共享',
+        'full': '完整训练'
+    }
+
+    fig = go.Figure()
+
+    segments1 = get_strategy_segments(exp1_gens, exp1_strategies)
+    segments2 = get_strategy_segments(exp2_gens, exp2_strategies)
+
+    for seg in segments1:
+        strategy = seg['strategy']
+        color = strategy_colors.get(strategy, '#888888')
+        display_name = strategy_display_names.get(strategy, strategy)
+
+        fig.add_trace(go.Bar(
+            x=[seg['end_gen'] - seg['start_gen'] + 1],
+            y=[exp1_name],
+            base=[seg['start_gen'] - 0.5],
+            orientation='h',
+            marker=dict(color=color, line=dict(color='white', width=2)),
+            name=display_name,
+            text=f"{display_name}<br>第{seg['start_gen']}~{seg['end_gen']}代",
+            hoverinfo='text',
+            legendgroup=display_name,
+            showlegend=True
+        ))
+
+    for seg in segments2:
+        strategy = seg['strategy']
+        color = strategy_colors.get(strategy, '#888888')
+        display_name = strategy_display_names.get(strategy, strategy)
+
+        fig.add_trace(go.Bar(
+            x=[seg['end_gen'] - seg['start_gen'] + 1],
+            y=[exp2_name],
+            base=[seg['start_gen'] - 0.5],
+            orientation='h',
+            marker=dict(color=color, line=dict(color='white', width=2)),
+            name=display_name,
+            text=f"{display_name}<br>第{seg['start_gen']}~{seg['end_gen']}代",
+            hoverinfo='text',
+            legendgroup=display_name,
+            showlegend=False
+        ))
+
+    all_gens = list(set(exp1_gens + exp2_gens))
+    max_gen = max(all_gens) if all_gens else 10
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='代数',
+        xaxis=dict(range=[-0.5, max_gen + 0.5]),
+        yaxis=dict(
+            showgrid=False,
+            zeroline=False
+        ),
+        template='plotly_white',
+        height=250,
+        barmode='stack',
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='right',
+            x=1
+        )
+    )
+
+    return fig
+
+
+def plot_dual_hypervolume_curves(exp1_hv: List[float], exp2_hv: List[float],
+                                 exp1_name: str = '实验1', exp2_name: str = '实验2',
+                                 title: str = '超体积曲线对比') -> go.Figure:
+    """
+    绘制两个实验的超体积曲线叠加对比
+
+    Args:
+        exp1_hv, exp2_hv: 两个实验的超体积历史
+        exp1_name, exp2_name: 实验名称
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    fig = go.Figure()
+
+    colors = ['#1f77b4', '#ff7f0e']
+
+    fig.add_trace(go.Scatter(
+        x=list(range(len(exp1_hv))),
+        y=exp1_hv,
+        mode='lines+markers',
+        marker=dict(size=8),
+        line=dict(width=3, color=colors[0]),
+        name=exp1_name,
+        hovertemplate='第%{x}代<br>超体积: %{y:.4f}<extra></extra>'
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=list(range(len(exp2_hv))),
+        y=exp2_hv,
+        mode='lines+markers',
+        marker=dict(size=8),
+        line=dict(width=3, color=colors[1]),
+        name=exp2_name,
+        hovertemplate='第%{x}代<br>超体积: %{y:.4f}<extra></extra>'
+    ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='代数',
+        yaxis_title='超体积',
+        template='plotly_white',
+        width=700,
+        height=450,
+        legend=dict(x=0.01, y=0.99),
+        hovermode='x unified'
+    )
+
+    return fig
+
+
+def plot_dual_pareto_scatter(exp1_points: np.ndarray, exp2_points: np.ndarray,
+                             exp1_name: str = '实验1', exp2_name: str = '实验2',
+                             maximize: List[bool] = None,
+                             x_dim: int = 1, y_dim: int = 0,
+                             x_label: str = '参数量', y_label: str = '精度',
+                             title: str = '最终帕累托前沿对比') -> go.Figure:
+    """
+    绘制两个实验的最终帕累托前沿叠加散点图
+
+    Args:
+        exp1_points, exp2_points: 两个实验的所有评估点
+        exp1_name, exp2_name: 实验名称
+        maximize: 各目标是否最大化
+        x_dim, y_dim: x轴和y轴维度索引
+        x_label, y_label: 轴标签
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    if maximize is None:
+        maximize = [True, False, False]
+
+    fig = go.Figure()
+
+    colors = ['#1f77b4', '#ff7f0e']
+
+    for exp_idx, (points, name) in enumerate([(exp1_points, exp1_name), (exp2_points, exp2_name)]):
+        pareto_indices = get_pareto_front_indices(points, maximize)
+        pareto_mask = np.zeros(len(points), dtype=bool)
+        pareto_mask[pareto_indices] = True
+
+        pareto_x = points[pareto_mask, x_dim]
+        pareto_y = points[pareto_mask, y_dim]
+        pareto_idx = np.arange(len(points))[pareto_mask]
+
+        if len(pareto_x) > 0:
+            sort_idx = np.argsort(pareto_x)
+            hover_text = [
+                f'{name} 架构 {pareto_idx[i]}<br>'
+                f'精度: {points[pareto_idx[i], 0]:.4f}<br>'
+                f'参数量: {points[pareto_idx[i], 1]/1e6:.2f}M<br>'
+                f'延迟: {points[pareto_idx[i], 2]:.3f}ms'
+                for i in range(len(pareto_idx))
+            ]
+            fig.add_trace(go.Scatter(
+                x=pareto_x[sort_idx],
+                y=pareto_y[sort_idx],
+                mode='lines+markers',
+                marker=dict(color=colors[exp_idx], size=10, line=dict(width=2, color='white')),
+                line=dict(color=colors[exp_idx], width=2),
+                name=f'{name} - 帕累托前沿',
+                hovertemplate='%{hovertext}<extra></extra>',
+                hovertext=[hover_text[i] for i in sort_idx]
+            ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        template='plotly_white',
+        width=700,
+        height=500,
+        legend=dict(x=0.01, y=0.99)
+    )
+
+    return fig
+
+
+def plot_calibration_history(incremental_r2_history: List[float],
+                             learning_curve_sizes: Optional[List[int]] = None,
+                             learning_curve_r2: Optional[np.ndarray] = None,
+                             title: str = '在线校准历史') -> go.Figure:
+    """
+    绘制在线校准历史折线图，与学习曲线对比
+
+    Args:
+        incremental_r2_history: 每次增量训练后的验证集R²列表
+        learning_curve_sizes: 学习曲线的训练样本数（可选）
+        learning_curve_r2: 学习曲线的R²分数 [N, 3]（可选）
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    fig = go.Figure()
+
+    if learning_curve_sizes is not None and learning_curve_r2 is not None and len(learning_curve_sizes) > 0:
+        avg_lc_r2 = np.mean(learning_curve_r2, axis=1)
+        fig.add_trace(go.Scatter(
+            x=learning_curve_sizes,
+            y=avg_lc_r2,
+            mode='lines+markers',
+            marker=dict(size=8),
+            line=dict(width=3, color='#1f77b4'),
+            name='学习曲线 (按样本数)',
+            hovertemplate='训练样本: %{x}<br>平均R²: %{y:.4f}<extra></extra>'
+        ))
+
+    if len(incremental_r2_history) > 0:
+        x_indices = list(range(1, len(incremental_r2_history) + 1))
+        fig.add_trace(go.Scatter(
+            x=x_indices,
+            y=incremental_r2_history,
+            mode='lines+markers',
+            marker=dict(size=10, symbol='diamond'),
+            line=dict(width=3, color='#ff7f0e', dash='dash'),
+            name='在线校准 (按增量训练次数)',
+            hovertemplate='第%{x}次增量训练<br>验证R²: %{y:.4f}<extra></extra>'
+        ))
+
+    fig.add_hline(
+        y=0.0,
+        line_dash='dash',
+        line_color='gray',
+        line_width=1
+    )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='增量训练次数 / 训练样本数',
+        yaxis_title='验证集 R² 决定系数',
+        template='plotly_white',
+        width=700,
+        height=450,
+        legend=dict(x=0.01, y=0.99)
+    )
+
+    return fig
+
+
+def compute_tsne_embedding(encodings: np.ndarray, perplexity: int = 30) -> np.ndarray:
+    """
+    计算编码向量的 t-SNE 二维嵌入
+
+    Args:
+        encodings: 编码向量矩阵 [N, D]
+        perplexity: t-SNE 的 perplexity 参数
+
+    Returns:
+        二维嵌入坐标 [N, 2]
+    """
+    from sklearn.manifold import TSNE
+
+    if len(encodings) < 2:
+        return np.zeros((len(encodings), 2))
+
+    actual_perplexity = min(perplexity, len(encodings) - 1)
+    if actual_perplexity < 1:
+        actual_perplexity = 1
+
+    try:
+        tsne = TSNE(n_components=2, perplexity=actual_perplexity,
+                    random_state=42, max_iter=300)
+        embedding = tsne.fit_transform(encodings)
+        return embedding
+    except:
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=2, random_state=42)
+        return pca.fit_transform(encodings)
+
+
+def plot_tsne_scatter(embedding: np.ndarray, points: np.ndarray,
+                      maximize: List[bool] = None,
+                      title: str = '种群编码 t-SNE 可视化',
+                      customdata: Optional[np.ndarray] = None) -> go.Figure:
+    """
+    绘制 t-SNE 二维散点图，帕累托前沿解用红色，非支配解用灰色
+
+    Args:
+        embedding: t-SNE 二维嵌入 [N, 2]
+        points: 目标值矩阵 [N, 3]，用于判断帕累托前沿
+        maximize: 各目标是否最大化
+        title: 图表标题
+        customdata: 自定义数据（用于点击交互）
+
+    Returns:
+        plotly Figure
+    """
+    if maximize is None:
+        maximize = [True, False, False]
+
+    fig = go.Figure()
+
+    pareto_indices = get_pareto_front_indices(points, maximize)
+    pareto_mask = np.zeros(len(points), dtype=bool)
+    pareto_mask[pareto_indices] = True
+
+    dominated_idx = np.where(~pareto_mask)[0]
+    pareto_idx = np.where(pareto_mask)[0]
+
+    if len(dominated_idx) > 0:
+        hover_text = [
+            f'架构 {idx}<br>'
+            f'精度: {points[idx, 0]:.4f}<br>'
+            f'参数量: {points[idx, 1]/1e6:.2f}M<br>'
+            f'延迟: {points[idx, 2]:.3f}ms'
+            for idx in dominated_idx
+        ]
+        fig.add_trace(go.Scatter(
+            x=embedding[dominated_idx, 0],
+            y=embedding[dominated_idx, 1],
+            mode='markers',
+            marker=dict(color='#888888', size=8, opacity=0.6,
+                        line=dict(width=1, color='white')),
+            name='被支配解',
+            customdata=dominated_idx if customdata is None else customdata[~pareto_mask],
+            hovertemplate='%{hovertext}<extra></extra>',
+            hovertext=hover_text
+        ))
+
+    if len(pareto_idx) > 0:
+        hover_text = [
+            f'架构 {idx} (帕累托)<br>'
+            f'精度: {points[idx, 0]:.4f}<br>'
+            f'参数量: {points[idx, 1]/1e6:.2f}M<br>'
+            f'延迟: {points[idx, 2]:.3f}ms'
+            for idx in pareto_idx
+        ]
+        fig.add_trace(go.Scatter(
+            x=embedding[pareto_idx, 0],
+            y=embedding[pareto_idx, 1],
+            mode='markers',
+            marker=dict(color='#FF4444', size=10,
+                        line=dict(width=2, color='white')),
+            name='帕累托前沿解',
+            customdata=pareto_idx if customdata is None else customdata[pareto_mask],
+            hovertemplate='%{hovertext}<extra></extra>',
+            hovertext=hover_text
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='t-SNE 维度1',
+        yaxis_title='t-SNE 维度2',
+        template='plotly_white',
+        width=600,
+        height=500,
+        legend=dict(x=0.01, y=0.99),
+        clickmode='event+select'
+    )
+
+    return fig
+
+
+def plot_param_diversity_curve_enhanced(
+    generations: List[int],
+    diversities: List[float],
+    mutation_rates: List[float],
+    crossover_rates: List[float],
+    strategy_switch_gens: Optional[List[int]] = None,
+    strategy_switch_labels: Optional[List[str]] = None,
+    title: str = '种群多样性与进化参数变化'
+) -> go.Figure:
+    """
+    增强版种群多样性与进化参数变化曲线
+
+    新增功能:
+    - 策略切换事件标注（垂直虚线+标签）
+    - 多样性触发变异率调整的区间高亮
+
+    Args:
+        generations: 代数列表
+        diversities: 每代多样性值
+        mutation_rates: 每代变异率
+        crossover_rates: 每代交叉率
+        strategy_switch_gens: 策略切换发生的代数列表
+        strategy_switch_labels: 策略切换的标签列表
+        title: 图表标题
+
+    Returns:
+        plotly Figure
+    """
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    low_div_regions = []
+    high_div_regions = []
+    in_low = False
+    in_high = False
+    low_start = 0
+    high_start = 0
+
+    for i, div in enumerate(diversities):
+        if div < 0.3 and not in_low:
+            low_start = i
+            in_low = True
+        elif div >= 0.3 and in_low:
+            low_div_regions.append((low_start, i - 1))
+            in_low = False
+
+        if div > 0.7 and not in_high:
+            high_start = i
+            in_high = True
+        elif div <= 0.7 and in_high:
+            high_div_regions.append((high_start, i - 1))
+            in_high = False
+
+    if in_low:
+        low_div_regions.append((low_start, len(diversities) - 1))
+    if in_high:
+        high_div_regions.append((high_start, len(diversities) - 1))
+
+    for start, end in low_div_regions:
+        fig.add_vrect(
+            x0=generations[start] - 0.5,
+            x1=generations[end] + 0.5,
+            fillcolor="#ffcccc",
+            opacity=0.3,
+            layer="below",
+            line_width=0,
+            name='低多样性区' if start == low_div_regions[0][0] else None,
+            showlegend=(start == low_div_regions[0][0])
+        )
+
+    for start, end in high_div_regions:
+        fig.add_vrect(
+            x0=generations[start] - 0.5,
+            x1=generations[end] + 0.5,
+            fillcolor="#ccffcc",
+            opacity=0.3,
+            layer="below",
+            line_width=0,
+            name='高多样性区' if start == high_div_regions[0][0] else None,
+            showlegend=(start == high_div_regions[0][0])
+        )
+
+    fig.add_trace(
+        go.Scatter(x=generations, y=diversities, mode='lines+markers',
+                   name='多样性', line=dict(color='#1f77b4', width=3), marker=dict(size=8)),
+        secondary_y=False,
+    )
+
+    fig.add_trace(
+        go.Scatter(x=generations, y=mutation_rates, mode='lines+markers',
+                   name='变异率', line=dict(color='#ff7f0e', width=2, dash='dash'), marker=dict(size=6)),
+        secondary_y=True,
+    )
+
+    fig.add_trace(
+        go.Scatter(x=generations, y=crossover_rates, mode='lines+markers',
+                   name='交叉率', line=dict(color='#2ca02c', width=2, dash='dot'), marker=dict(size=6)),
+        secondary_y=True,
+    )
+
+    if strategy_switch_gens and strategy_switch_labels:
+        for i, (gen, label) in enumerate(zip(strategy_switch_gens, strategy_switch_labels)):
+            fig.add_vline(
+                x=gen,
+                line_dash='dash',
+                line_color='#9467bd',
+                line_width=2,
+                annotation_text=label,
+                annotation_position='top right',
+                annotation_font_color='#9467bd',
+                annotation_font_size=10
+            )
+
+    fig.add_hline(y=0.3, line_dash='dash', line_color='red', line_width=1,
+                  annotation_text='低多样性阈值(0.3)', secondary_y=False)
+    fig.add_hline(y=0.7, line_dash='dash', line_color='green', line_width=1,
+                  annotation_text='高多样性阈值(0.7)', secondary_y=False)
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='代数',
+        template='plotly_white',
+        width=700,
+        height=450,
+        legend=dict(x=0.01, y=0.99),
+        clickmode='event+select'
+    )
+
+    fig.update_yaxes(title_text='多样性 (0~1)', secondary_y=False, range=[0, 1])
+    fig.update_yaxes(title_text='进化参数概率', secondary_y=True, range=[0, 1])
+
+    return fig

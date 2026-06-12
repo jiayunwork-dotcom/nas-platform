@@ -50,6 +50,7 @@ class ExperimentConfig:
     surrogate_percentile: float = 30.0
     device: str = 'cpu'
     use_adaptive_scheduling: bool = True
+    objective_weights: List[float] = field(default_factory=lambda: [1/3, 1/3, 1/3])
     created_at: str = field(default_factory=lambda: datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
     def to_dict(self) -> Dict:
@@ -161,7 +162,8 @@ class Experiment:
         if self.config.use_adaptive_scheduling:
             self.adaptive_scheduler = AdaptiveScheduler(
                 base_mutation_rate=self.config.mutation_rate,
-                base_crossover_rate=self.config.crossover_rate
+                base_crossover_rate=self.config.crossover_rate,
+                objective_weights=self.config.objective_weights
             )
 
     def _init_surrogate(self):
@@ -241,10 +243,18 @@ class Experiment:
 
         return population, actually_evaluated, surrogate_skipped, eval_duration
 
-    def _update_surrogate(self):
-        """更新代理模型"""
+    def _update_surrogate(self, new_archs: Optional[List[Architecture]] = None):
+        """
+        更新代理模型（支持增量训练）
+
+        Args:
+            new_archs: 本代新增的已评估架构，如果为None则进行全量训练
+        """
         if self.surrogate and len(self.result.all_evaluated) >= self.config.surrogate_min_samples:
-            self.surrogate.train(self.result.all_evaluated)
+            if self.surrogate.trained and new_archs and len(new_archs) > 0:
+                self.surrogate.incremental_train(new_archs, self.result.all_evaluated)
+            else:
+                self.surrogate.train(self.result.all_evaluated)
 
     def _create_snapshot(self, generation: int, population: List[Architecture],
                          surrogate_used: bool, eval_strategy: str = 'fast',
@@ -298,9 +308,11 @@ class Experiment:
         if use_adaptive:
             current_strategy = self.adaptive_scheduler.state.current_eval_strategy
 
+        eval_count_before = len(self.result.all_evaluated)
         population, actually_eval, skipped, eval_dur = self._evaluate_population(
             population, use_surrogate=False, eval_strategy=current_strategy
         )
+        new_archs_gen0 = self.result.all_evaluated[eval_count_before:]
 
         snapshot = self._create_snapshot(
             0, population, surrogate_used=False,
@@ -320,6 +332,8 @@ class Experiment:
                 eval_strategy=current_strategy, eval_duration=eval_dur
             )
             self.adaptive_scheduler.record_efficiency_stats(gen_stats)
+
+        self._update_surrogate(new_archs_gen0)
 
         for gen in range(1, self.config.num_generations + 1):
             if progress_callback:
@@ -363,13 +377,15 @@ class Experiment:
             use_surrogate = (self.surrogate is not None and
                            len(self.result.all_evaluated) >= self.config.surrogate_min_samples)
 
+            eval_count_before = len(self.result.all_evaluated)
             offspring, actually_eval, skipped, eval_dur = self._evaluate_population(
                 offspring, use_surrogate=use_surrogate, eval_strategy=current_strategy
             )
+            new_archs_this_gen = self.result.all_evaluated[eval_count_before:]
 
             population = self.algorithm.step(population, offspring)
 
-            self._update_surrogate()
+            self._update_surrogate(new_archs_this_gen)
 
             snapshot = self._create_snapshot(
                 gen, population, surrogate_used=use_surrogate,

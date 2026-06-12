@@ -31,7 +31,11 @@ from src.visualization import (
     detect_convergence, get_arch_rank_and_crowding,
     plot_prediction_scatter, plot_pareto_with_uncertainty,
     plot_surrogate_learning_curve, plot_eval_efficiency_bar,
-    plot_strategy_duration_pie, plot_param_diversity_curve
+    plot_strategy_duration_pie, plot_param_diversity_curve,
+    plot_dual_hypervolume_curves, plot_dual_strategy_timeline,
+    plot_dual_pareto_scatter, plot_calibration_history,
+    plot_tsne_scatter, compute_tsne_embedding,
+    plot_param_diversity_curve_enhanced
 )
 from src.metrics import count_architecture_flops, hypervolume, get_reference_point
 
@@ -353,13 +357,39 @@ def create_experiment_page():
                 st.markdown("""
                 - **阶段1（前5代）**: 使用SynFlow零代价代理快速筛选，积累初始样本
                 - **阶段2（第6代+）**: 代理模型就绪后，切换为「代理预筛 + 快速真实评估」的混合模式
-                - **HV低增长触发**: 连续3代超体积增长率<5%，自动升级为更精确的评估策略（fast→synflow→naswot→...）
+                - **双指标低增长触发**: 连续3代超体积增长率<5% 且 加权目标改善率<3%，自动升级评估策略
                 - **多样性警报触发**: 帕累托前沿解减少>20%，强制对当前前沿解做完整评估校准
                 - **进化参数自适应**: 种群多样性<0.3时变异率↑50%，>0.7时变异率↓30%，交叉率反向调整
                 """)
                 st.caption("💡 每次策略切换都会记录详细日志，可在实验详情页的「策略日志」tab查看。")
+
+                st.markdown("---")
+                st.subheader("⚖️ 目标偏好权重")
+                st.caption("设置三个目标的相对权重（归一化到和为1），用于计算加权目标改善率")
+
+                col_w1, col_w2, col_w3 = st.columns(3)
+                with col_w1:
+                    w_accuracy = st.slider("精度权重", min_value=0.0, max_value=1.0, value=1/3, step=0.05, key="w_acc")
+                with col_w2:
+                    w_params = st.slider("参数量权重", min_value=0.0, max_value=1.0, value=1/3, step=0.05, key="w_params")
+                with col_w3:
+                    w_latency = st.slider("延迟权重", min_value=0.0, max_value=1.0, value=1/3, step=0.05, key="w_latency")
+
+                total_w = w_accuracy + w_params + w_latency
+                if total_w > 0:
+                    w_accuracy_norm = w_accuracy / total_w
+                    w_params_norm = w_params / total_w
+                    w_latency_norm = w_latency / total_w
+                else:
+                    w_accuracy_norm = w_params_norm = w_latency_norm = 1/3
+
+                st.info(
+                    f"📊 归一化后权重: 精度={w_accuracy_norm:.2f}, "
+                    f"参数量={w_params_norm:.2f}, 延迟={w_latency_norm:.2f}"
+                )
             else:
                 st.info("ℹ️ 自适应调度已关闭，将使用固定的评估策略和进化参数（勾选上方复选框可启用智能调度）。")
+                w_accuracy_norm = w_params_norm = w_latency_norm = 1/3
 
     st.markdown("---")
 
@@ -367,6 +397,7 @@ def create_experiment_page():
 
     with col_start:
         if st.button("🚀 开始搜索", type="primary", disabled=len(enabled_ops) == 0, use_container_width=True):
+            objective_weights = [w_accuracy_norm, w_params_norm, w_latency_norm] if use_adaptive else [1/3, 1/3, 1/3]
             config = ExperimentConfig(
                 name=exp_name,
                 algorithm=algorithm,
@@ -384,6 +415,7 @@ def create_experiment_page():
                 surrogate_min_samples=surrogate_min_samples,
                 surrogate_percentile=surrogate_percentile,
                 use_adaptive_scheduling=use_adaptive,
+                objective_weights=objective_weights,
                 device=device
             )
 
@@ -512,9 +544,9 @@ def view_experiment_page():
         if snapshot.surrogate_used:
             st.success(f"🤖 本代使用了代理模型预筛 - 实际评估: {snapshot.actually_evaluated}, 代理跳过: {snapshot.surrogate_skipped}")
 
-        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
             "🎯 帕累托前沿 2D", "🌐 帕累托前沿 3D", "📐 架构详情",
-            "📊 历史曲线", "🧠 预测分析", "📊 效率统计", "📜 策略日志"
+            "📊 历史曲线", "🧠 预测分析", "📊 效率统计", "📜 策略日志", "⚔️ 实时对比"
         ])
 
         with tab1:
@@ -691,15 +723,96 @@ def view_experiment_page():
 
             if len(result.generations) > 1:
                 st.subheader("🧬 种群多样性与进化参数变化")
+                st.caption("💡 点击曲线上的点可查看该代种群的 t-SNE 可视化")
+
                 gens_list = list(range(len(result.generations)))
                 div_list = [gen.diversity for gen in result.generations]
                 mut_list = [gen.mutation_rate for gen in result.generations]
                 cross_list = [gen.crossover_rate for gen in result.generations]
-                param_fig = plot_param_diversity_curve(
+
+                strategy_switch_gens = []
+                strategy_switch_labels = []
+                if result.strategy_switch_logs:
+                    for log in result.strategy_switch_logs:
+                        strategy_switch_gens.append(log.generation)
+                        new_display = EVAL_STRATEGIES.get(log.new_strategy, log.new_strategy)
+                        strategy_switch_labels.append(f'→{new_display.split(" ")[0]}')
+
+                param_fig = plot_param_diversity_curve_enhanced(
                     gens_list, div_list, mut_list, cross_list,
+                    strategy_switch_gens=strategy_switch_gens if strategy_switch_gens else None,
+                    strategy_switch_labels=strategy_switch_labels if strategy_switch_labels else None,
                     title='种群多样性与进化参数随代数变化'
                 )
-                st.plotly_chart(param_fig, use_container_width=True)
+                param_selection = st.plotly_chart(
+                    param_fig, use_container_width=True,
+                    on_select="rerun",
+                    key=f"param_div_{selected_exp}"
+                )
+
+                selected_gen_for_tsne = None
+                if param_selection and param_selection.get('selection') and param_selection['selection'].get('points'):
+                    sel_points = param_selection['selection']['points']
+                    if len(sel_points) > 0:
+                        x_val = sel_points[0].get('x')
+                        if x_val is not None and 0 <= int(x_val) < len(result.generations):
+                            selected_gen_for_tsne = int(x_val)
+
+                if selected_gen_for_tsne is None:
+                    selected_gen_for_tsne = current_gen
+
+                st.markdown("---")
+                st.subheader(f"🔬 第 {selected_gen_for_tsne} 代种群编码 t-SNE 可视化")
+
+                tsne_col1, tsne_col2 = st.columns([2, 1])
+
+                with tsne_col1:
+                    snapshot_gen = result.generations[selected_gen_for_tsne]
+                    pop = snapshot_gen.population
+                    points_gen = snapshot_gen.get_fitness_matrix()
+
+                    encodings = np.array([arch.encode().astype(float) for arch in pop])
+                    perplexity = min(30, len(pop) - 1)
+
+                    with st.spinner(f"计算 t-SNE 嵌入 (perplexity={perplexity})..."):
+                        embedding = compute_tsne_embedding(encodings, perplexity=perplexity)
+
+                    tsne_fig = plot_tsne_scatter(
+                        embedding, points_gen,
+                        maximize=MAXIMIZE,
+                        title=f'第 {selected_gen_for_tsne} 代种群 t-SNE 可视化'
+                    )
+                    tsne_selection = st.plotly_chart(
+                        tsne_fig, use_container_width=True,
+                        on_select="rerun",
+                        key=f"tsne_{selected_exp}_{selected_gen_for_tsne}"
+                    )
+
+                with tsne_col2:
+                    st.markdown("### 📍 选中架构详情")
+
+                    selected_tsne_idx = None
+                    if tsne_selection and tsne_selection.get('selection') and tsne_selection['selection'].get('points'):
+                        sel_pts = tsne_selection['selection']['points']
+                        if len(sel_pts) > 0 and sel_pts[0].get('customdata') is not None:
+                            selected_tsne_idx = int(sel_pts[0]['customdata'])
+
+                    if selected_tsne_idx is not None and 0 <= selected_tsne_idx < len(pop):
+                        selected_arch = pop[selected_tsne_idx]
+
+                        is_pareto = False
+                        pareto_indices = get_pareto_front_indices(points_gen, MAXIMIZE)
+                        if selected_tsne_idx in pareto_indices:
+                            is_pareto = True
+                            st.success("🏆 帕累托前沿解")
+                        else:
+                            st.info("被支配解")
+
+                        st.metric("🎯 精度", f"{selected_arch.accuracy:.4f}")
+                        st.metric("📦 参数量", f"{selected_arch.params/1e6:.2f} M")
+                        st.metric("⏱️ 延迟", f"{selected_arch.latency:.3f} ms")
+                    else:
+                        st.info("👆 点击左侧 t-SNE 散点图中的点查看架构详情")
 
         with tab5:
             st.subheader("🧠 代理模型性能预测置信度分析")
@@ -808,6 +921,51 @@ def view_experiment_page():
                         else:
                             st.info("样本数量不足，无法绘制学习曲线。")
 
+                    st.markdown("### 🔄 在线校准历史")
+                    st.caption("记录每次增量训练后的验证集R²变化，与学习曲线形成对比")
+
+                    calib_history = exp.surrogate.get_calibration_history()
+
+                    metric_cols = st.columns(4)
+                    with metric_cols[0]:
+                        st.metric("增量训练次数", calib_history['incremental_count'])
+                    with metric_cols[1]:
+                        st.metric("回滚次数", calib_history['rollback_count'])
+                    with metric_cols[2]:
+                        st.metric("全量重训次数", calib_history['full_retrain_count'])
+                    with metric_cols[3]:
+                        if len(calib_history['incremental_r2_history']) > 0:
+                            current_r2 = calib_history['incremental_r2_history'][-1]
+                            st.metric("当前验证R²", f"{current_r2:.4f}")
+                        else:
+                            st.metric("当前验证R²", "—")
+
+                    if len(calib_history['incremental_r2_history']) > 0 or len(learning_data['train_sizes']) > 0:
+                        fig_calib = plot_calibration_history(
+                            calib_history['incremental_r2_history'],
+                            learning_data['train_sizes'] if len(learning_data['train_sizes']) > 0 else None,
+                            learning_data['r2_scores'] if len(learning_data['train_sizes']) > 0 else None,
+                            title='在线校准历史 vs 学习曲线'
+                        )
+                        st.plotly_chart(fig_calib, use_container_width=True)
+                    else:
+                        st.info("暂无在线校准数据。运行实验后，每代新增的评估结果会触发增量校准。")
+
+                    if calib_history['calibration_events']:
+                        with st.expander("📋 校准事件详情"):
+                            event_data = []
+                            for i, event in enumerate(calib_history['calibration_events']):
+                                event_type = '增量训练' if event['type'] == 'incremental' else '回滚并重训'
+                                event_data.append({
+                                    '序号': i + 1,
+                                    '类型': event_type,
+                                    '增量次数': event.get('incremental_count', '-'),
+                                    '原R²': f"{event.get('prev_r2', 0):.4f}" if event.get('prev_r2') is not None else '-',
+                                    '新R²': f"{event.get('new_r2', 0):.4f}" if event.get('new_r2') is not None else '-',
+                                    '说明': event.get('reason', '')
+                                })
+                            st.dataframe(pd.DataFrame(event_data), use_container_width=True, hide_index=True)
+
         with tab6:
             st.subheader("📊 搜索效率统计")
 
@@ -912,6 +1070,29 @@ def view_experiment_page():
                 switch_df = pd.DataFrame(switch_data)
                 st.dataframe(switch_df, use_container_width=True, hide_index=True)
 
+            if exp.surrogate is not None and exp.surrogate.trained:
+                calib_history = exp.surrogate.get_calibration_history()
+                rollback_events = [e for e in calib_history['calibration_events']
+                                   if e['type'] == 'rollback_and_retrain']
+
+                if rollback_events:
+                    st.markdown("---")
+                    st.subheader("⚠️ 代理模型回滚与重训事件")
+                    st.warning(f"共发生 {len(rollback_events)} 次代理模型回滚 + 全量重训")
+
+                    rollback_data = []
+                    for i, event in enumerate(rollback_events):
+                        rollback_data.append({
+                            '序号': i + 1,
+                            '增量训练次数': event.get('incremental_count', '-'),
+                            '原R²': f"{event.get('prev_r2', 0):.4f}",
+                            '新R²': f"{event.get('new_r2', 0):.4f}",
+                            '下降幅度': f"{(event.get('prev_r2', 0) - event.get('new_r2', 0)) / abs(event.get('prev_r2', 1)) * 100:.1f}%"
+                            if event.get('prev_r2', 0) > 0 else '-',
+                            '原因': event.get('reason', '')
+                        })
+                    st.dataframe(pd.DataFrame(rollback_data), use_container_width=True, hide_index=True)
+
             st.markdown("---")
             st.subheader("📋 每代参数快照")
             if len(result.generations) > 0:
@@ -930,6 +1111,143 @@ def view_experiment_page():
                     })
                 snapshot_df = pd.DataFrame(snapshot_data)
                 st.dataframe(snapshot_df, use_container_width=True, hide_index=True)
+
+        with tab8:
+            st.subheader("⚔️ 实时对比分析")
+            st.caption("选择另一个已完成的实验进行逐代对比分析")
+
+            exp_list = st.session_state.exp_manager.list_experiments()
+            completed_exps = [name for name in exp_list
+                              if name != selected_exp
+                              and st.session_state.exp_manager.get_experiment(name)
+                              and st.session_state.exp_manager.get_experiment(name).result.completed]
+
+            if not completed_exps:
+                st.info("📭 没有其他已完成的实验可供对比。请先运行更多实验。")
+            else:
+                compare_exp_name = st.selectbox(
+                    "选择对比实验",
+                    completed_exps,
+                    key="compare_exp_select"
+                )
+
+                if compare_exp_name:
+                    exp2 = st.session_state.exp_manager.get_experiment(compare_exp_name)
+                    if exp2:
+                        result2 = exp2.result
+                        config2 = exp2.config
+
+                        st.markdown("---")
+                        st.subheader("📈 超体积曲线对比")
+
+                        hv_fig = plot_dual_hypervolume_curves(
+                            result.hypervolume_history,
+                            result2.hypervolume_history,
+                            exp1_name=config.name,
+                            exp2_name=config2.name,
+                            title='超体积曲线对比'
+                        )
+                        st.plotly_chart(hv_fig, use_container_width=True)
+
+                        st.markdown("---")
+                        st.subheader("📊 策略切换时间线对比")
+
+                        exp1_gens = list(range(len(result.generations)))
+                        exp1_strategies = [gen.eval_strategy for gen in result.generations]
+                        exp2_gens = list(range(len(result2.generations)))
+                        exp2_strategies = [gen.eval_strategy for gen in result2.generations]
+
+                        timeline_fig = plot_dual_strategy_timeline(
+                            exp1_gens, exp1_strategies,
+                            exp2_gens, exp2_strategies,
+                            exp1_name=config.name,
+                            exp2_name=config2.name,
+                            title='策略切换时间线对比'
+                        )
+                        st.plotly_chart(timeline_fig, use_container_width=True)
+
+                        st.markdown("---")
+                        st.subheader("🎯 最终帕累托前沿对比")
+
+                        exp1_points = result.get_all_points()
+                        exp2_points = result2.get_all_points()
+
+                        pareto_fig = plot_dual_pareto_scatter(
+                            exp1_points, exp2_points,
+                            exp1_name=config.name,
+                            exp2_name=config2.name,
+                            maximize=MAXIMIZE,
+                            x_dim=1, y_dim=0,
+                            x_label='参数量', y_label='精度',
+                            title='精度 vs 参数量 帕累托前沿对比'
+                        )
+                        st.plotly_chart(pareto_fig, use_container_width=True)
+
+                        st.markdown("---")
+                        st.subheader("📋 关键差异汇总")
+
+                        total_eval1 = len(result.all_evaluated)
+                        total_eval2 = len(result2.all_evaluated)
+                        eval_diff = total_eval1 - total_eval2
+
+                        all_points1 = result.get_all_points()
+                        all_points2 = result2.get_all_points()
+                        ref_point1 = get_reference_point(all_points1, MAXIMIZE)
+                        ref_point2 = get_reference_point(all_points2, MAXIMIZE)
+                        final_hv1 = hypervolume(all_points1, ref_point1, MAXIMIZE)
+                        final_hv2 = hypervolume(all_points2, ref_point2, MAXIMIZE)
+                        hv_diff = final_hv1 - final_hv2
+
+                        savings1 = 0.0
+                        savings2 = 0.0
+                        if result.generations:
+                            total_cand1 = sum(g.actually_evaluated + g.surrogate_skipped for g in result.generations)
+                            total_skip1 = sum(g.surrogate_skipped for g in result.generations)
+                            savings1 = (total_skip1 / total_cand1 * 100) if total_cand1 > 0 else 0.0
+                        if result2.generations:
+                            total_cand2 = sum(g.actually_evaluated + g.surrogate_skipped for g in result2.generations)
+                            total_skip2 = sum(g.surrogate_skipped for g in result2.generations)
+                            savings2 = (total_skip2 / total_cand2 * 100) if total_cand2 > 0 else 0.0
+                        savings_diff = savings1 - savings2
+
+                        conv_gen1, _, _ = detect_convergence(
+                            result.hypervolume_history, threshold=0.01, window_size=5
+                        )
+                        conv_gen2, _, _ = detect_convergence(
+                            result2.hypervolume_history, threshold=0.01, window_size=5
+                        )
+                        conv_diff = None
+                        if conv_gen1 is not None and conv_gen2 is not None:
+                            conv_diff = conv_gen1 - conv_gen2
+
+                        diff_data = [
+                            {
+                                '指标': '总评估次数',
+                                config.name: total_eval1,
+                                config2.name: total_eval2,
+                                '差异': f"{eval_diff:+d}"
+                            },
+                            {
+                                '指标': '代理节省率',
+                                config.name: f"{savings1:.1f}%",
+                                config2.name: f"{savings2:.1f}%",
+                                '差异': f"{savings_diff:+.1f}%"
+                            },
+                            {
+                                '指标': '最终超体积(HV)',
+                                config.name: f"{final_hv1:.4f}",
+                                config2.name: f"{final_hv2:.4f}",
+                                '差异': f"{hv_diff:+.4f}"
+                            },
+                            {
+                                '指标': '收敛代数',
+                                config.name: f"第{conv_gen1}代" if conv_gen1 is not None else "未收敛",
+                                config2.name: f"第{conv_gen2}代" if conv_gen2 is not None else "未收敛",
+                                '差异': f"{conv_diff:+d}代" if conv_diff is not None else "—"
+                            },
+                        ]
+                        diff_df = pd.DataFrame(diff_data)
+                        st.dataframe(diff_df, use_container_width=True, hide_index=True)
 
         st.markdown("---")
 

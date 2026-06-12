@@ -81,6 +81,18 @@ class SurrogateModel:
         self.X_history = None
         self.y_history = None
 
+        self.prev_model_state = None
+        self.prev_scaler_X_state = None
+        self.prev_scaler_y_state = None
+        self.prev_val_r2 = None
+        self.current_val_r2 = None
+
+        self.incremental_train_count = 0
+        self.incremental_r2_history = []
+        self.rollback_count = 0
+        self.full_retrain_count = 0
+        self.calibration_events = []
+
     def _encode_architectures(self, archs: List[Architecture]) -> np.ndarray:
         """将架构列表编码为矩阵"""
         encodings = []
@@ -99,13 +111,41 @@ class SurrogateModel:
         """检查是否有足够数据训练代理模型"""
         return self.X_history is not None and len(self.X_history) >= self.min_train_samples
 
+    def _save_model_state(self):
+        """保存当前模型状态（用于回滚）"""
+        if self.model is not None:
+            self.prev_model_state = copy.deepcopy(self.model.state_dict())
+            self.prev_scaler_X_state = copy.deepcopy(self.scaler_X)
+            self.prev_scaler_y_state = copy.deepcopy(self.scaler_y)
+            self.prev_val_r2 = self.current_val_r2
+
+    def _rollback_model(self):
+        """回滚到上一个模型状态"""
+        if self.prev_model_state is not None:
+            self.model.load_state_dict(self.prev_model_state)
+            self.scaler_X = self.prev_scaler_X_state
+            self.scaler_y = self.prev_scaler_y_state
+            self.current_val_r2 = self.prev_val_r2
+            self.rollback_count += 1
+            return True
+        return False
+
+    def _compute_avg_val_r2(self, evaluated_archs: List[Architecture]) -> float:
+        """计算验证集平均R²"""
+        if len(evaluated_archs) < 10:
+            return 0.0
+        metrics = self.compute_validation_metrics(evaluated_archs, train_ratio=0.8)
+        return float(np.mean(metrics['r2']))
+
     def train(self, evaluated_archs: List[Architecture]):
         """
-        使用所有已评估数据训练代理模型
+        使用所有已评估数据训练代理模型（全量训练）
         """
         if len(evaluated_archs) < self.min_train_samples:
             self.trained = False
             return
+
+        self._save_model_state()
 
         X = self._encode_architectures(evaluated_archs)
         y = self._get_targets(evaluated_archs)
@@ -137,6 +177,129 @@ class SurrogateModel:
                 total_loss += loss.item()
 
         self.trained = True
+        self.current_val_r2 = self._compute_avg_val_r2(evaluated_archs)
+        self.full_retrain_count += 1
+
+    def incremental_train(self, new_archs: List[Architecture], all_archs: List[Architecture]):
+        """
+        增量训练代理模型
+
+        Args:
+            new_archs: 新增的已评估架构
+            all_archs: 所有已评估架构（用于计算验证R²）
+
+        Returns:
+            dict: 包含训练结果信息的字典
+        """
+        if not self.trained or self.model is None:
+            self.train(all_archs)
+            return {
+                'type': 'full_train',
+                'success': True,
+                'val_r2': self.current_val_r2,
+                'rollback': False
+            }
+
+        if len(new_archs) == 0:
+            return {
+                'type': 'skipped',
+                'success': True,
+                'val_r2': self.current_val_r2,
+                'rollback': False
+            }
+
+        self._save_model_state()
+        prev_r2 = self.current_val_r2 if self.current_val_r2 is not None else 0.0
+
+        new_X = self._encode_architectures(new_archs)
+        new_y = self._get_targets(new_archs)
+
+        if self.X_history is not None and self.y_history is not None:
+            self.X_history = np.vstack([self.X_history, new_X])
+            self.y_history = np.vstack([self.y_history, new_y])
+        else:
+            self.X_history = new_X
+            self.y_history = new_y
+
+        all_X = self.X_history
+        all_y = self.y_history
+
+        X_scaled = self.scaler_X.fit_transform(all_X)
+        y_scaled = self.scaler_y.fit_transform(all_y)
+
+        dataset = ArchDataset(X_scaled, y_scaled)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        incremental_epochs = 20
+        incremental_lr = self.lr * 0.1
+        optimizer = optim.Adam(self.model.parameters(), lr=incremental_lr)
+        criterion = nn.MSELoss()
+
+        self.model.train()
+        for epoch in range(incremental_epochs):
+            total_loss = 0.0
+            for batch_X, batch_y in loader:
+                batch_X = batch_X.to(self.device)
+                batch_y = batch_y.to(self.device)
+                optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+
+        new_val_r2 = self._compute_avg_val_r2(all_archs)
+        self.current_val_r2 = new_val_r2
+
+        rollback_triggered = False
+        if prev_r2 > 0 and (prev_r2 - new_val_r2) / abs(prev_r2) > 0.10:
+            self._rollback_model()
+            rollback_triggered = True
+            self.train(all_archs)
+            event = {
+                'type': 'rollback_and_retrain',
+                'incremental_count': self.incremental_train_count,
+                'prev_r2': prev_r2,
+                'new_r2': new_val_r2,
+                'reason': f'R²下降{(prev_r2 - new_val_r2) / abs(prev_r2) * 100:.1f}%>10%，触发回滚并重训'
+            }
+            self.calibration_events.append(event)
+            self.full_retrain_count += 1
+        else:
+            self.incremental_train_count += 1
+            self.incremental_r2_history.append(new_val_r2)
+            event = {
+                'type': 'incremental',
+                'incremental_count': self.incremental_train_count,
+                'prev_r2': prev_r2,
+                'new_r2': new_val_r2,
+                'reason': '增量训练成功'
+            }
+            self.calibration_events.append(event)
+
+        return {
+            'type': 'incremental',
+            'success': True,
+            'val_r2': self.current_val_r2,
+            'rollback': rollback_triggered,
+            'prev_r2': prev_r2,
+            'new_r2': new_val_r2
+        }
+
+    def get_calibration_history(self) -> Dict:
+        """
+        获取在线校准历史
+
+        Returns:
+            包含增量训练次数和每次R²的字典
+        """
+        return {
+            'incremental_count': self.incremental_train_count,
+            'incremental_r2_history': self.incremental_r2_history,
+            'rollback_count': self.rollback_count,
+            'full_retrain_count': self.full_retrain_count,
+            'calibration_events': self.calibration_events
+        }
 
     def predict(self, archs: List[Architecture]) -> np.ndarray:
         """

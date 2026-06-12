@@ -47,13 +47,17 @@ class AdaptiveState:
     current_crossover_rate: float = 0.9
     current_diversity: float = 0.5
     hv_growth_history: List[float] = field(default_factory=list)
+    weighted_score_history: List[float] = field(default_factory=list)
+    weighted_improvement_history: List[float] = field(default_factory=list)
     pareto_size_history: List[int] = field(default_factory=list)
     strategy_switch_logs: List[StrategySwitchLog] = field(default_factory=list)
     efficiency_stats: List[GenerationEfficiencyStats] = field(default_factory=list)
     low_hv_growth_consecutive: int = 0
+    low_weighted_improvement_consecutive: int = 0
     diversity_alarm_triggered: bool = False
     base_mutation_rate: float = 0.1
     base_crossover_rate: float = 0.9
+    objective_weights: List[float] = field(default_factory=lambda: [1/3, 1/3, 1/3])
 
 
 def compute_population_diversity(population: List[Architecture]) -> float:
@@ -116,18 +120,75 @@ def compute_hypervolume_growth_rate(hv_history: List[float], window: int = 1) ->
     return (curr - prev) / abs(prev)
 
 
+def compute_weighted_score(points: np.ndarray, weights: List[float], maximize: List[bool]) -> float:
+    """
+    计算帕累托前沿解的平均加权得分
+
+    Args:
+        points: 目标值矩阵 [N, 3]
+        weights: 目标权重 [w_accuracy, w_params, w_latency]，和为1
+        maximize: 各目标是否最大化
+
+    Returns:
+        avg_weighted_score: 前沿解的平均加权得分
+    """
+    if len(points) == 0:
+        return 0.0
+
+    fronts = fast_non_dominated_sort(points, maximize)
+    if not fronts or len(fronts[0]) == 0:
+        return 0.0
+
+    pareto_points = points[fronts[0]]
+    n_pareto = len(pareto_points)
+
+    norm_points = np.zeros_like(pareto_points)
+    for dim in range(pareto_points.shape[1]):
+        min_val = np.min(pareto_points[:, dim])
+        max_val = np.max(pareto_points[:, dim])
+        if max_val == min_val:
+            norm_points[:, dim] = 0.5
+        else:
+            norm_points[:, dim] = (pareto_points[:, dim] - min_val) / (max_val - min_val)
+        if not maximize[dim]:
+            norm_points[:, dim] = 1.0 - norm_points[:, dim]
+
+    weighted_scores = np.zeros(n_pareto)
+    for dim in range(len(weights)):
+        weighted_scores += weights[dim] * norm_points[:, dim]
+
+    return float(np.mean(weighted_scores))
+
+
+def compute_weighted_improvement_rate(weighted_history: List[float], window: int = 1) -> float:
+    """
+    计算加权目标改善率
+    """
+    if len(weighted_history) < window + 1:
+        return 1.0
+    prev = weighted_history[-(window + 1)]
+    curr = weighted_history[-1]
+    if prev == 0:
+        return 1.0 if curr > 0 else 0.0
+    return (curr - prev) / abs(prev)
+
+
 class AdaptiveScheduler:
     """
     自适应调度器
     根据搜索过程中的实时反馈自动调整评估策略和进化参数
     """
 
-    def __init__(self, base_mutation_rate: float = 0.1, base_crossover_rate: float = 0.9):
+    def __init__(self, base_mutation_rate: float = 0.1, base_crossover_rate: float = 0.9,
+                 objective_weights: List[float] = None):
+        if objective_weights is None:
+            objective_weights = [1/3, 1/3, 1/3]
         self.state = AdaptiveState(
             base_mutation_rate=base_mutation_rate,
             base_crossover_rate=base_crossover_rate,
             current_mutation_rate=base_mutation_rate,
-            current_crossover_rate=base_crossover_rate
+            current_crossover_rate=base_crossover_rate,
+            objective_weights=objective_weights
         )
         self.maximize = [True, False, False]
 
@@ -159,11 +220,22 @@ class AdaptiveScheduler:
         规则:
         1. 前5代使用SynFlow快速筛选
         2. 第6代开始如果代理模型已训练好，切换为代理模型预筛+快速代理真实评估的混合模式
-        3. 连续3代超体积增长率低于5%时，升级为更精确的评估策略
+        3. 连续3代超体积增长率<5% 且 加权目标改善率<3% 时，升级为更精确的评估策略
         4. 某代帕累托前沿解数量比上一代减少超过20%时，触发种群多样性警报，强制校准
         """
         hv_growth_rate = compute_hypervolume_growth_rate(hv_history)
         self.state.hv_growth_history.append(hv_growth_rate)
+
+        points = np.array([[a.accuracy, a.params, a.latency] for a in population
+                           if a.accuracy is not None])
+        weighted_score = compute_weighted_score(
+            points, self.state.objective_weights, self.maximize
+        )
+        self.state.weighted_score_history.append(weighted_score)
+        weighted_improvement = compute_weighted_improvement_rate(
+            self.state.weighted_score_history
+        )
+        self.state.weighted_improvement_history.append(weighted_improvement)
 
         pareto_size = get_pareto_front_size(population, self.maximize)
         self.state.pareto_size_history.append(pareto_size)
@@ -183,19 +255,31 @@ class AdaptiveScheduler:
             )
             return
 
-        if len(self.state.hv_growth_history) >= 3:
-            recent_growths = self.state.hv_growth_history[-3:]
-            if all(g < 0.05 for g in recent_growths):
+        if len(self.state.hv_growth_history) >= 3 and len(self.state.weighted_improvement_history) >= 3:
+            recent_hv_growths = self.state.hv_growth_history[-3:]
+            recent_weighted_improvements = self.state.weighted_improvement_history[-3:]
+
+            all_hv_low = all(g < 0.05 for g in recent_hv_growths)
+            all_weighted_low = all(g < 0.03 for g in recent_weighted_improvements)
+
+            if all_hv_low:
                 self.state.low_hv_growth_consecutive += 1
-                if self.state.low_hv_growth_consecutive >= 1:
-                    self._upgrade_eval_strategy(
-                        generation,
-                        f"连续3代超体积增长率低于5% "
-                        f"({recent_growths[0]*100:.1f}%, {recent_growths[1]*100:.1f}%, "
-                        f"{recent_growths[2]*100:.1f}%)，升级评估策略以获得更精确结果"
-                    )
             else:
                 self.state.low_hv_growth_consecutive = 0
+
+            if all_weighted_low:
+                self.state.low_weighted_improvement_consecutive += 1
+            else:
+                self.state.low_weighted_improvement_consecutive = 0
+
+            if all_hv_low and all_weighted_low and self.state.low_hv_growth_consecutive >= 1:
+                hv_avg = np.mean(recent_hv_growths) * 100
+                weighted_avg = np.mean(recent_weighted_improvements) * 100
+                self._upgrade_eval_strategy(
+                    generation,
+                    f"连续3代双指标低于阈值: HV增长率{hv_avg:.1f}%<5%, "
+                    f"加权改善率{weighted_avg:.1f}%<3%，升级评估策略以获得更精确结果"
+                )
 
         if len(self.state.pareto_size_history) >= 2:
             prev_size = self.state.pareto_size_history[-2]
