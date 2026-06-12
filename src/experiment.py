@@ -175,6 +175,7 @@ class Experiment:
         for arch in to_evaluate:
             if arch.accuracy is None:
                 self.evaluator.evaluate(arch)
+                arch.is_evaluated = True
                 self.result.all_evaluated.append(arch)
 
         for arch in population:

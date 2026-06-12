@@ -15,7 +15,7 @@ from PIL import Image
 
 from .cell import Architecture, OP_COLORS
 from .dag_utils import to_networkx_graph
-from .metrics import fast_non_dominated_sort, hypervolume, get_reference_point
+from .metrics import fast_non_dominated_sort, hypervolume, get_reference_point, crowding_distance
 
 
 def get_pareto_front_indices(points: np.ndarray, maximize: List[bool]) -> List[int]:
@@ -30,9 +30,10 @@ def plot_pareto_2d(points: np.ndarray, maximize: List[bool],
                    title: str = '帕累托前沿',
                    pareto_indices: Optional[List[int]] = None,
                    color: str = '#FF4444',
-                   showlegend: bool = True) -> go.Figure:
+                   showlegend: bool = True,
+                   customdata: Optional[np.ndarray] = None) -> go.Figure:
     """
-    绘制二维帕累托散点图
+    绘制二维帕累托散点图，支持点击交互
     """
     if pareto_indices is None:
         pareto_indices = get_pareto_front_indices(points, maximize)
@@ -40,24 +41,35 @@ def plot_pareto_2d(points: np.ndarray, maximize: List[bool],
     pareto_mask = np.zeros(len(points), dtype=bool)
     pareto_mask[pareto_indices] = True
 
+    all_indices = np.arange(len(points))
+
     fig = go.Figure()
 
     dominated_x = points[~pareto_mask, x_dim]
     dominated_y = points[~pareto_mask, y_dim]
+    dominated_idx = all_indices[~pareto_mask]
     if len(dominated_x) > 0:
+        hover_text = [f'架构 {idx}<br>精度: {points[idx, 0]:.4f}<br>参数量: {points[idx, 1]/1e6:.2f}M<br>延迟: {points[idx, 2]:.3f}ms'
+                      for idx in dominated_idx]
         fig.add_trace(go.Scatter(
             x=dominated_x,
             y=dominated_y,
             mode='markers',
             marker=dict(color='#888888', size=8, opacity=0.6),
             name='被支配解',
-            showlegend=showlegend
+            showlegend=showlegend,
+            customdata=dominated_idx.reshape(-1, 1) if customdata is None else customdata[~pareto_mask],
+            hovertemplate='%{hovertext}<extra></extra>',
+            hovertext=hover_text
         ))
 
     pareto_x = points[pareto_mask, x_dim]
     pareto_y = points[pareto_mask, y_dim]
+    pareto_idx = all_indices[pareto_mask]
     if len(pareto_x) > 0:
         sort_idx = np.argsort(pareto_x)
+        hover_text = [f'架构 {pareto_idx[i]}<br>精度: {points[pareto_idx[i], 0]:.4f}<br>参数量: {points[pareto_idx[i], 1]/1e6:.2f}M<br>延迟: {points[pareto_idx[i], 2]:.3f}ms'
+                      for i in range(len(pareto_idx))]
         fig.add_trace(go.Scatter(
             x=pareto_x[sort_idx],
             y=pareto_y[sort_idx],
@@ -65,7 +77,10 @@ def plot_pareto_2d(points: np.ndarray, maximize: List[bool],
             marker=dict(color=color, size=10, line=dict(width=2, color='white')),
             line=dict(color=color, width=2),
             name='帕累托前沿',
-            showlegend=showlegend
+            showlegend=showlegend,
+            customdata=pareto_idx[sort_idx].reshape(-1, 1) if customdata is None else customdata[pareto_mask][sort_idx],
+            hovertemplate='%{hovertext}<extra></extra>',
+            hovertext=[hover_text[i] for i in sort_idx]
         ))
 
     fig.update_layout(
@@ -75,7 +90,8 @@ def plot_pareto_2d(points: np.ndarray, maximize: List[bool],
         template='plotly_white',
         width=600,
         height=500,
-        legend=dict(x=0.01, y=0.99)
+        legend=dict(x=0.01, y=0.99),
+        clickmode='event+select'
     )
 
     return fig
@@ -496,3 +512,166 @@ def plot_operations_legend() -> go.Figure:
     )
 
     return fig
+
+
+def plot_adjacency_heatmap(adj: np.ndarray, title: str = '邻接矩阵') -> go.Figure:
+    """
+    绘制邻接矩阵热力图
+    """
+    n = adj.shape[0]
+    fig = go.Figure(data=go.Heatmap(
+        z=adj.astype(int),
+        x=list(range(n)),
+        y=list(range(n)),
+        colorscale=[[0, '#f0f0f0'], [1, '#3498db']],
+        showscale=False,
+        hoverongaps=False,
+        text=[[f'{i}→{j}' if adj[i, j] else '' for j in range(n)] for i in range(n)],
+        texttemplate='%{text}',
+        textfont=dict(size=10)
+    ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='目标节点',
+        yaxis_title='源节点',
+        template='plotly_white',
+        width=400,
+        height=350
+    )
+
+    return fig
+
+
+def plot_hypervolume_curve_with_convergence(
+    hypervolumes: List[float],
+    convergence_gen: Optional[int] = None,
+    title: str = '超体积随代数变化',
+    label: str = '超体积',
+    color: str = '#1f77b4'
+) -> go.Figure:
+    """
+    绘制带收敛判定线的超体积变化曲线
+    """
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=list(range(len(hypervolumes))),
+        y=hypervolumes,
+        mode='lines+markers',
+        marker=dict(size=8),
+        line=dict(width=3, color=color),
+        name=label
+    ))
+
+    if convergence_gen is not None and 0 <= convergence_gen < len(hypervolumes):
+        fig.add_vline(
+            x=convergence_gen,
+            line_dash='dash',
+            line_color='#27ae60',
+            line_width=3,
+            annotation_text='收敛点',
+            annotation_position='top right',
+            annotation_font_color='#27ae60'
+        )
+        fig.add_trace(go.Scatter(
+            x=[convergence_gen],
+            y=[hypervolumes[convergence_gen]],
+            mode='markers',
+            marker=dict(size=15, color='#27ae60', symbol='diamond',
+                        line=dict(width=3, color='white')),
+            name='收敛点',
+            showlegend=True
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='代数',
+        yaxis_title='超体积',
+        template='plotly_white',
+        width=700,
+        height=450,
+        legend=dict(x=0.01, y=0.99)
+    )
+
+    return fig
+
+
+def detect_convergence(hypervolumes: List[float],
+                       threshold: float = 0.01,
+                       window_size: int = 5) -> Tuple[Optional[int], float, float]:
+    """
+    检测搜索收敛点
+
+    Args:
+        hypervolumes: 超体积历史列表
+        threshold: 变化率阈值 (默认1%)
+        window_size: 连续窗口大小 (默认5代)
+
+    Returns:
+        (convergence_gen, avg_recent_rate, convergence_rate): 
+            convergence_gen: 收敛代数，未收敛则为None
+            avg_recent_rate: 最近窗口的平均变化率
+            convergence_rate: 收敛时窗口内的最大变化率，未收敛则为最近窗口的最大变化率
+    """
+    if len(hypervolumes) < window_size + 1:
+        return None, 0.0, 0.0
+
+    change_rates = []
+    for i in range(1, len(hypervolumes)):
+        if hypervolumes[i - 1] != 0:
+            rate = abs(hypervolumes[i] - hypervolumes[i - 1]) / abs(hypervolumes[i - 1])
+        else:
+            rate = 1.0
+        change_rates.append(rate)
+
+    convergence_gen = None
+    convergence_rate = 0.0
+    for i in range(len(change_rates) - window_size + 1):
+        window_rates = change_rates[i:i + window_size]
+        if all(r < threshold for r in window_rates):
+            convergence_gen = i + window_size
+            convergence_rate = max(window_rates)
+            break
+
+    recent_window = change_rates[-window_size:] if len(change_rates) >= window_size else change_rates
+    avg_recent_rate = np.mean(recent_window) if recent_window else 0.0
+    max_recent_rate = np.max(recent_window) if recent_window else 0.0
+
+    if convergence_gen is None:
+        convergence_rate = max_recent_rate
+
+    return convergence_gen, avg_recent_rate, convergence_rate
+
+
+def get_arch_rank_and_crowding(points: np.ndarray,
+                               arch_idx: int,
+                               maximize: List[bool]) -> Tuple[int, float]:
+    """
+    获取架构的非支配层级和拥挤距离
+
+    Args:
+        points: 所有架构的目标值矩阵
+        arch_idx: 目标架构索引
+        maximize: 各目标是否最大化
+
+    Returns:
+        (rank, crowding_distance): 非支配层级和拥挤距离
+    """
+    fronts = fast_non_dominated_sort(points, maximize)
+
+    rank = -1
+    front_idx_in_front = -1
+    for front_rank, front in enumerate(fronts):
+        if arch_idx in front:
+            rank = front_rank
+            front_idx_in_front = front.index(arch_idx)
+            break
+
+    if rank == -1:
+        return -1, 0.0
+
+    distances = crowding_distance(points, fronts[rank])
+    crowding = distances[front_idx_in_front]
+
+    return rank, crowding

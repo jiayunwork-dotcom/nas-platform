@@ -247,6 +247,7 @@ class Architecture:
         self.accuracy = None
         self.params = None
         self.latency = None
+        self.is_evaluated = False
 
     def _random_adjacency(self) -> np.ndarray:
         """生成随机邻接矩阵（上三角）"""

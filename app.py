@@ -26,7 +26,9 @@ from src.visualization import (
     plot_multi_experiment_pareto, plot_hypervolume_curve,
     plot_multi_hypervolume_curves, plot_dag_graph,
     plot_network_architecture, create_pareto_animation,
-    plot_operations_legend, get_pareto_front_indices
+    plot_operations_legend, get_pareto_front_indices,
+    plot_adjacency_heatmap, plot_hypervolume_curve_with_convergence,
+    detect_convergence, get_arch_rank_and_crowding
 )
 from src.metrics import count_architecture_flops, hypervolume, get_reference_point
 
@@ -56,6 +58,116 @@ EVAL_STRATEGIES = {
 }
 
 MAXIMIZE = [True, False, False]
+
+
+def render_architecture_detail(arch, config, points=None, arch_idx=None, surrogate=None):
+    """
+    渲染架构详情面板
+
+    Args:
+        arch: Architecture对象
+        config: ExperimentConfig对象
+        points: 种群目标值矩阵 (用于计算层级和拥挤距离)
+        arch_idx: 架构在种群中的索引
+        surrogate: 代理模型对象 (用于显示预测置信区间)
+    """
+    st.subheader("🏗️ 架构详情")
+
+    if arch.is_evaluated:
+        st.success("✅ 已评估 (真实评估)")
+    else:
+        st.info("🤖 代理预测")
+        if surrogate is not None and surrogate.trained:
+            try:
+                pred = surrogate.predict([arch])
+                mae, rmse = surrogate.get_prediction_error([arch])
+                st.caption("代理模型预测值，置信区间基于训练误差估计")
+                st.caption(
+                    f"训练MAE: 精度 {mae[0]:.4f}, "
+                    f"参数量 {mae[1]/1e3:.1f}K, "
+                    f"延迟 {mae[2]:.3f}ms"
+                )
+            except:
+                st.caption("该架构由代理模型预测，尚未经过真实评估")
+        else:
+            st.caption("该架构尚未经过真实评估")
+
+    metric_cols = st.columns(3)
+    with metric_cols[0]:
+        st.metric("🎯 精度", f"{arch.accuracy:.4f}")
+    with metric_cols[1]:
+        st.metric("📦 参数量", f"{arch.params/1e6:.2f} M")
+    with metric_cols[2]:
+        st.metric("⏱️ 延迟", f"{arch.latency:.3f} ms")
+
+    if points is not None and arch_idx is not None:
+        rank, crowding = get_arch_rank_and_crowding(points, arch_idx, MAXIMIZE)
+        info_cols = st.columns(2)
+        with info_cols[0]:
+            st.metric("📊 非支配层级", f"第 {rank} 层" if rank >= 0 else "未知")
+        with info_cols[1]:
+            crowding_str = f"{crowding:.4f}" if not np.isinf(crowding) else "∞ (边界点)"
+            st.metric("📏 拥挤距离", crowding_str)
+
+    st.markdown("---")
+    st.subheader("🔬 Cell DAG 图")
+
+    dag_col1, dag_col2 = st.columns(2)
+    with dag_col1:
+        fig_n = plot_dag_graph(
+            arch.normal_adj,
+            arch.normal_op_list,
+            arch.enabled_ops,
+            "Normal Cell"
+        )
+        st.plotly_chart(fig_n, use_container_width=True)
+
+    with dag_col2:
+        fig_r = plot_dag_graph(
+            arch.reduce_adj,
+            arch.reduce_op_list,
+            arch.enabled_ops,
+            "Reduction Cell"
+        )
+        st.plotly_chart(fig_r, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("🧬 架构编码向量")
+
+    enc_col1, enc_col2 = st.columns(2)
+    with enc_col1:
+        fig_adj_n = plot_adjacency_heatmap(
+            arch.normal_adj,
+            "Normal Cell 邻接矩阵"
+        )
+        st.plotly_chart(fig_adj_n, use_container_width=True)
+        st.caption("Normal Cell 操作列表:")
+        st.code(str(arch.normal_op_list))
+
+    with enc_col2:
+        fig_adj_r = plot_adjacency_heatmap(
+            arch.reduce_adj,
+            "Reduction Cell 邻接矩阵"
+        )
+        st.plotly_chart(fig_adj_r, use_container_width=True)
+        st.caption("Reduction Cell 操作列表:")
+        st.code(str(arch.reduce_op_list))
+
+    st.markdown("---")
+    st.subheader("📐 网络信息")
+
+    flops = count_architecture_flops(
+        arch,
+        num_cells=config.num_cells,
+        init_channels=config.init_channels
+    )
+    info_cols2 = st.columns(3)
+    with info_cols2[0]:
+        st.metric("🔢 FLOPs", f"{flops/1e6:.2f} M")
+    with info_cols2[1]:
+        st.metric("🔗 Normal Cell边数", int(arch.normal_adj.sum()))
+    with info_cols2[2]:
+        st.metric("🔗 Reduction Cell边数", int(arch.reduce_adj.sum()))
 
 
 def init_session_state():
@@ -368,6 +480,8 @@ def view_experiment_page():
         tab1, tab2, tab3, tab4 = st.tabs(["🎯 帕累托前沿 2D", "🌐 帕累托前沿 3D", "📐 架构详情", "📊 历史曲线"])
 
         with tab1:
+            st.info("💡 点击散点图上的任意点查看该架构的详细信息")
+
             pareto_col1, pareto_col2 = st.columns(2)
             with pareto_col1:
                 fig1 = plot_pareto_2d(
@@ -376,7 +490,11 @@ def view_experiment_page():
                     x_label='参数量', y_label='精度',
                     title=f'精度 vs 参数量 (第{current_gen}代)'
                 )
-                st.plotly_chart(fig1, use_container_width=True)
+                selection1 = st.plotly_chart(
+                    fig1, use_container_width=True,
+                    on_select="rerun",
+                    key=f"pareto1_{current_gen}_{selected_exp}"
+                )
 
             with pareto_col2:
                 fig2 = plot_pareto_2d(
@@ -385,7 +503,38 @@ def view_experiment_page():
                     x_label='延迟 (ms)', y_label='精度',
                     title=f'精度 vs 延迟 (第{current_gen}代)'
                 )
-                st.plotly_chart(fig2, use_container_width=True)
+                selection2 = st.plotly_chart(
+                    fig2, use_container_width=True,
+                    on_select="rerun",
+                    key=f"pareto2_{current_gen}_{selected_exp}"
+                )
+
+            selected_idx = None
+            selection_data = None
+
+            if selection1 and selection1.get('selection') and selection1['selection'].get('points'):
+                selection_data = selection1['selection']['points']
+            elif selection2 and selection2.get('selection') and selection2['selection'].get('points'):
+                selection_data = selection2['selection']['points']
+
+            if selection_data and len(selection_data) > 0:
+                point_data = selection_data[0]
+                if point_data.get('customdata') is not None:
+                    selected_idx = int(point_data['customdata'][0])
+
+            if selected_idx is not None and 0 <= selected_idx < len(snapshot.population):
+                selected_arch = snapshot.population[selected_idx]
+
+                st.markdown("---")
+                st.info(f"📍 已选中架构 #{selected_idx}")
+                render_architecture_detail(
+                    selected_arch, config,
+                    points=points,
+                    arch_idx=selected_idx,
+                    surrogate=exp.surrogate if hasattr(exp, 'surrogate') else None
+                )
+            else:
+                st.info("👆 点击上方散点图中的任意点查看架构详情")
 
         with tab2:
             fig3d = plot_pareto_3d(
@@ -467,12 +616,30 @@ def view_experiment_page():
                 st.info("本代暂无帕累托前沿架构")
 
         with tab4:
-            hv_fig = plot_hypervolume_curve(
+            convergence_gen, avg_change_rate, convergence_rate = detect_convergence(
                 result.hypervolume_history,
+                threshold=0.01,
+                window_size=5
+            )
+
+            hv_fig = plot_hypervolume_curve_with_convergence(
+                result.hypervolume_history,
+                convergence_gen=convergence_gen,
                 title='超体积随代数变化',
                 label=config.name
             )
             st.plotly_chart(hv_fig, use_container_width=True)
+
+            if convergence_gen is not None:
+                st.success(
+                    f"✅ 搜索于第 {convergence_gen} 代收敛，"
+                    f"超体积变化率已降至 {convergence_rate * 100:.2f}% 以下"
+                )
+            else:
+                st.info(
+                    f"⏳ 搜索尚未收敛，"
+                    f"当前最近5代平均变化率为 {avg_change_rate * 100:.2f}%"
+                )
 
             if len(result.generations) > 1:
                 st.subheader("🎬 帕累托演变动画")
